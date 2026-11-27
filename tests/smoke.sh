@@ -44,7 +44,7 @@ cleanup() {
       echo "---- logs: $c ----"; docker logs "$c" 2>&1 | tail -40 || true
     done
   fi
-  [ ${#started[@]} -gt 0 ] && docker rm -f -v "${started[@]}" >/dev/null 2>&1 || true
+  if [ ${#started[@]} -gt 0 ]; then docker rm -f -v "${started[@]}" >/dev/null 2>&1 || true; fi
   docker network rm "$net" >/dev/null 2>&1 || true
   exit $status
 }

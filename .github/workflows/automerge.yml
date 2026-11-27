@@ -39,6 +39,7 @@ jobs:
       CHECKS: "smoke DCO title"
     steps:
       - name: Wait for the checks
+        id: checks
         run: |
           set -euo pipefail
           for _ in $(seq 1 160); do                    # up to ~80 minutes
@@ -49,16 +50,20 @@ jobs:
                     --jq '.check_runs[0] | "\(.status) \(.conclusion)"' 2>/dev/null || true)
               case "$r" in
                 "completed success"|"completed skipped"|"completed neutral") ;;
-                completed*) echo "::notice::$name failed ($r): no auto-merge"; exit 0 ;;
+                completed*) echo "::notice::$name failed ($r): no auto-merge"
+                            echo "green=false" >> "$GITHUB_OUTPUT"; exit 0 ;;
                 *) state=wait ;;
               esac
             done
-            [ "$state" = ok ] && exit 0
+            if [ "$state" = ok ]; then echo "green=true" >> "$GITHUB_OUTPUT"; exit 0; fi
             sleep 30
           done
           echo "::warning::the checks did not finish in time"; exit 1
 
+      # Only after every check passed: a failed check ends the step above
+      # with success, so it is the output that tells.
       - name: Merge when there is no conflict
+        if: steps.checks.outputs.green == 'true'
         run: |
           set -euo pipefail
           # GitHub works out mergeability in the background: ask a few times.
