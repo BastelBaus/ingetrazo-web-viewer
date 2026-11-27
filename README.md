@@ -146,6 +146,9 @@ All settings are environment variables. See [`.env.example`](.env.example) for t
 
 ![Architecture](docs/architecture.drawio.png)
 
+<sub>The diagram still shows the setup before the split into this repo and ingetrazo-docker's engines; it will be
+redrawn.</sub>
+
 <sub>The diagram is editable: open `docs/architecture.drawio.png` in [draw.io / diagrams.net](https://app.diagrams.net)
 (the diagram is embedded in the PNG) and save it back as PNG. `docs/architecture.drawio` is the same diagram as
 XML; `python docs/render_drawio_png.py` re-renders the PNG from it.</sub>

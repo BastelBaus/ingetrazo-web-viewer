@@ -51,3 +51,10 @@ jobs:
         env:
           IMAGE: ingetrazo-web-viewer:ci
         run: tests/smoke.sh
+
+      - name: Validate compose file
+        env:
+          MCP_TOKEN: ci-dummy-token-0123456789
+        run: |
+          docker compose --profile viewer config -q
+          docker compose -f compose.yaml -f compose.folders.example.yaml --profile viewer config -q
