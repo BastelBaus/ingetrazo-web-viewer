@@ -169,12 +169,14 @@ services:
       - engine-state:/state
       - engine-secret:/engine
 
+# IPv4 only, both networks: some Docker hosts (TrueNAS) create networks with
+# IPv6 and report the gateway with its prefix ("fd..::1/64"), which docker
+# compose then fails to parse on the next `up` or `down` of the network.
 networks:
+  default:
+    enable_ipv6: false
   engine:
     internal: true       # the services <-> their engines only, no way out
-    # IPv4 only: some Docker hosts (TrueNAS) report an IPv6 gateway with its
-    # prefix ("fd..::1/64"), which docker compose then fails to parse on the
-    # next `up` or `down` of an existing internal network.
     enable_ipv6: false
 
 volumes:
@@ -182,7 +184,7 @@ volumes:
   viewer-cache:
   viewer-state:
   engine-state:
-  engine-secret:
+  engine-secret:         # the viewer engine's secret, made on its first start
   mcp-engine-state:
-  mcp-engine-secret:     # the MCP engine's secret, made on its first start         # the viewer engine's secret, made on its first start
+  mcp-engine-secret:     # the MCP engine's secret, made on its first start
   users:                 # the user list (users.db), shared by both services
