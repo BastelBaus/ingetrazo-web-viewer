@@ -1,12 +1,16 @@
-# ingetrazo-docker
+# ingetrazo-web-viewer
 
-Run [IngeTrazo](https://github.com/ingelibre/ingetrazo) — the free push/pull 3D and BIM modeller — **headless in a
-container**:
+The web side of running [IngeTrazo](https://github.com/ingelibre/ingetrazo) — the free push/pull 3D and BIM
+modeller — **headless on a server**: an MCP gateway for AI agents and a live web viewer, with users, OAuth and
+folder rights. IngeTrazo itself runs in **engines**: containers of the
+[ingetrazo-docker](https://github.com/BastelBaus/ingetrazo-docker) image on an internal network. This image has no
+IngeTrazo, no X server and no OpenGL; it is Python's standard library and three.js.
 
-- **MCP server over HTTP**: lets AI agents (Claude Code, Claude Desktop, claude.ai, Cursor, VS Code, …) model,
+- **MCP gateway over HTTP** (`mcp`): lets AI agents (Claude Code, Claude Desktop, claude.ai, Cursor, VS Code, …) model,
   query, render and save documents. The tools are IngeTrazo's own (`run_python`, `query_model`, `screenshot`,
-  sheets, views, export, …), plus `list_documents` for the model folders.
-- **Live viewer (optional)**: a read-only web page with the **sheets** and **saved views** of every model in the
+  sheets, views, export, …), plus `list_documents` for the model folders. The gateway checks the token or OAuth
+  and each user's folders, then hands the request to its engine.
+- **Live viewer** (`viewer`, optional): a read-only web page with the **sheets** and **saved views** of every model in the
   model folders. The overview shows a small preview per model, folder by folder. A sheet or view is rendered when
   someone opens it, and kept until its file changes; the page refreshes by itself. A model page shows one
   sheet or view at a time, fitted to the window. A slim top bar has three dropdowns, **View**, **3D** and
@@ -20,32 +24,25 @@ container**:
 - **Your models stay in folders you mount**: `./data` on the host, or several folders, each read-only or
   read/write for the MCP service (see [Model folders](#model-folders)).
 
-IngeTrazo itself is not modified: the image builds it from a git ref on GitHub.
+| Image | Repository | Services |
+|---|---|---|
+| `ghcr.io/bastelbaus/ingetrazo-web-viewer` | this one | `mcp` (the MCP gateway) and `viewer` |
+| `ghcr.io/bastelbaus/ingetrazo` | [ingetrazo-docker](https://github.com/BastelBaus/ingetrazo-docker) | `engine`: IngeTrazo headless, one per service (`mcp-engine`, `viewer-engine`) |
 
-Two images, built from the one `Dockerfile` and published with the same tags:
-
-| Image | Target | Contents | Services |
-|---|---|---|---|
-| `ghcr.io/bastelbaus/ingetrazo` | `engine` (default) | IngeTrazo headless, Xvfb, Mesa | `engine` (for the services of the viewer image); `mcp` and `viewer` all in one, as before |
-| `ghcr.io/bastelbaus/ingetrazo-viewer` | `viewer` | users, OAuth, folder rights and pages; Python standard library only | `mcp` (the MCP gateway) and `viewer`, each through `engine` containers |
+The [`compose.yaml`](compose.yaml) here runs all of them.
 
 | Viewer: every model in the data folder | Viewer: one model's sheets and views |
 |---|---|
 | ![Overview](docs/viewer-overview.png) | ![Model page](docs/viewer-model.png) |
 
-> **Status:** early. Headless mode is in IngeTrazo 0.6.3. What the container still needs from the fork
-> ([#1544](https://github.com/ingelibre/ingetrazo/pull/1544) sheets and scenes over MCP,
-> [#1586](https://github.com/ingelibre/ingetrazo/pull/1586), [#1683](https://github.com/ingelibre/ingetrazo/pull/1683),
-> [#1685](https://github.com/ingelibre/ingetrazo/pull/1685)) is tracked in
-> [ingelibre/ingetrazo#1717](https://github.com/ingelibre/ingetrazo/issues/1717). Until it is merged, the engine
-> image builds from the fork, pinned to a commit; CI also builds and tests the newest upstream release
-> (job *upstream*, informational) to show when it can switch.
+> **Status:** early. Moved out of ingetrazo-docker (its history is kept here). Which IngeTrazo the engines run,
+> and what is still missing upstream, is ingetrazo-docker's business: see its README.
 
 ## Quick start
 
 ```sh
-git clone https://github.com/BastelBaus/ingetrazo-docker
-cd ingetrazo-docker
+git clone https://github.com/BastelBaus/ingetrazo-web-viewer
+cd ingetrazo-web-viewer
 cp .env.example .env
 # set MCP_TOKEN in .env, e.g. to the output of: openssl rand -hex 32
 # and ADMIN_PASSWORD (or VIEWER_AUTH_MODE=none for a viewer without login)
@@ -54,8 +51,9 @@ mkdir -p data && cp /path/to/*.igz data/
 docker compose --profile viewer up -d
 ```
 
-This pulls the prebuilt images `ghcr.io/bastelbaus/ingetrazo:latest` and `ghcr.io/bastelbaus/ingetrazo-viewer:latest`
-(amd64 and arm64). Add `--build` to build them locally instead, e.g. against another `INGETRAZO_REF`.
+This pulls the prebuilt images `ghcr.io/bastelbaus/ingetrazo-web-viewer:latest` and `ghcr.io/bastelbaus/ingetrazo:latest`
+(amd64 and arm64). Add `--build` to build this repo's image locally; the engine image is always pulled (build it in
+ingetrazo-docker to change the IngeTrazo version).
 
 - MCP: `http://localhost:8765/mcp` (bearer token)
 - Viewer: `http://localhost:8080` (user `admin`, your `ADMIN_PASSWORD`)
@@ -116,9 +114,9 @@ All settings are environment variables. See [`.env.example`](.env.example) for t
 | `INGETRAZO_DATA_DIR` | `./data` | Host folder mounted at `/data` |
 | `MODEL_FOLDERS` | – | Several model folders under `/data`, each `rw` or `ro`, with scan options (see [Model folders](#model-folders)) |
 | `MODEL_SCAN_DEPTH` / `MODEL_EXCLUDE` | – | Defaults for every folder: how deep to look for models; globs to leave out |
-| `INGETRAZO_MODEL` | – | Document to open at start (relative to `/data`) |
-| `INGETRAZO_ALLOW_SAVE` | `true` | Allow `save_document` |
-| `INGETRAZO_SAVE_FORMAT` | – | `json` = plain-JSON `.igz`, diffable in git |
+| `INGETRAZO_MODEL` | – | `mcp-engine`: document to open at start (relative to `/data`) |
+| `INGETRAZO_ALLOW_SAVE` | `true` | `mcp-engine`: allow `save_document` |
+| `INGETRAZO_SAVE_FORMAT` | – | `mcp-engine`: `json` = plain-JSON `.igz`, diffable in git |
 | `MCP_AUTH` | `token` | `none`, `token` or `oauth` |
 | `MCP_TOKEN` | – | Bearer token with every right, at least 16 characters (`token` mode); optional when users use personal tokens (see [Users](#users)) |
 | `PUBLIC_URL` | – | `oauth`: the https URL clients reach the server at |
@@ -130,20 +128,19 @@ All settings are environment variables. See [`.env.example`](.env.example) for t
 | `ADMIN_USER` | `admin` | `local`: the name of the first admin |
 | `ADMIN_PASSWORD` | – | `local`: the first admin's password; login page for browsers, Basic auth for scripts. `VIEWER_USER` / `VIEWER_PASSWORD`, the old names, still work |
 | `VIEWER_PRERENDER` | `previews` | What the viewer renders before anyone looks: `previews`, `none` or `all` (see [Rendering on demand](#rendering-on-demand)) |
-| `ENGINE_URLS` | compose: `http://viewer-engine:8766` | The viewer's render engines, comma-separated, one render worker each (see [How it works](#how-it-works)); unset: the viewer runs its own IngeTrazos (engine image only) |
+| `MCP_ENGINE_URL` | compose: `http://mcp-engine:8766` | The gateway's engine (required) |
+| `ENGINE_URLS` | compose: `http://viewer-engine:8766` | The viewer's render engines, comma-separated, one render worker each (required; see [How it works](#how-it-works)) |
 | `ENGINE_TOKEN` / `MCP_ENGINE_TOKEN` | – | The secret the viewer / the MCP gateway shares with its engine (at least 16 characters); unset: the engine makes one in its `*-secret` volume (`ENGINE_TOKEN_FILE`) |
-| `VIEWER_WORKERS` | `1` | Without `ENGINE_URLS` only: how many IngeTrazos the viewer starts itself, 1–16 |
-| `VIEWER_TITLE` | `IngeTrazo-docker` | The headline (overview, login page, browser tab); admins can change it at `/admin` → *Title* |
+| `VIEWER_TITLE` | `IngeTrazo` | The headline (overview, login page, browser tab); admins can change it at `/admin` → *Title* |
 | `VIEWER_SHEET_DPI` | `120` | Sheet image resolution |
 | `VIEWER_NAV_MODE` | `tree` | How the View / 3D / Sheet dropdowns show folders by default: `tree` (one level at a time) or `list` (all levels); each user can switch (kept in their settings) |
 | `VIEWER_GLB_MAX_MB` | `50` | 3D view: a model whose GLB is bigger gets no 3D view (it is still rendered as sheets and views); `0` turns the 3D view off |
 | `INGETRAZO_AI_TIMEOUT` | app default (180 s) | How long one call may run before IngeTrazo answers `timed out on the UI thread`; raise it for big models on software rendering. Needs an IngeTrazo with [ingelibre/ingetrazo#1586](https://github.com/ingelibre/ingetrazo/pull/1586) |
-| `HEALTH_MAX_BUSY_SECONDS` | `900` | MCP `/healthz` turns `blocked` (503) after one call ran this long; keep it above `INGETRAZO_AI_TIMEOUT` |
-| `XVFB_SCREEN` | `2560x1600x24` | Virtual screen of the in-memory X server; smaller = less memory |
-| `INGETRAZO_IMAGE` | `ghcr.io/bastelbaus/ingetrazo:latest` | Engine image to pull (or tag to build) |
-| `VIEWER_IMAGE` | `ghcr.io/bastelbaus/ingetrazo-viewer:latest` | Viewer image to pull (or tag to build) |
-| `INGETRAZO_REPO` / `INGETRAZO_REF` | fork / pinned commit | Which IngeTrazo to build |
-| `INGETRAZO_DOCKER_REF` | `dev` | This repo's tag or commit for a local build; shown in the viewer's footer and at `/version` |
+| `HEALTH_MAX_BUSY_SECONDS` | `900` | Engines: `/healthz` turns `blocked` (503) after one call ran this long; keep it above `INGETRAZO_AI_TIMEOUT` |
+| `XVFB_SCREEN` | `2560x1600x24` | Engines: virtual screen of the in-memory X server; smaller = less memory |
+| `INGETRAZO_IMAGE` | `ghcr.io/bastelbaus/ingetrazo:latest` | Engine image to pull |
+| `WEB_VIEWER_IMAGE` | `ghcr.io/bastelbaus/ingetrazo-web-viewer:latest` | This repo's image to pull (or tag to build) |
+| `WEB_VIEWER_REF` | `dev` | This repo's tag or commit for a local build; shown in the viewer's footer and at `/version` |
 
 ## How it works
 
@@ -153,10 +150,12 @@ All settings are environment variables. See [`.env.example`](.env.example) for t
 (the diagram is embedded in the PNG) and save it back as PNG. `docs/architecture.drawio` is the same diagram as
 XML; `python docs/render_drawio_png.py` re-renders the PNG from it.</sub>
 
-Each engine container runs one IngeTrazo **without a window** (`--headless --ai-bridge`). It renders with OpenGL in
-software (Mesa llvmpipe) inside an in-memory X server (Xvfb).
+This image's two services hold everything that concerns people: logins, users, rights, pages. Every engine
+container (the [ingetrazo-docker](https://github.com/BastelBaus/ingetrazo-docker) image) runs one IngeTrazo
+**without a window**, with OpenGL in software (Mesa llvmpipe) inside an in-memory X server, and knows only one
+service token. The services and their engines meet on the internal `engine` network; only the services have ports.
 
-- **`mcp`** (viewer image): the MCP gateway AI clients reach. It checks the bearer token or OAuth and each user's
+- **`mcp`** (this image): the MCP gateway AI clients reach. It checks the bearer token or OAuth and each user's
   folders, adds `list_documents`, keeps file paths inside the model folders (writes inside the read/write ones,
   and the user's), hides `shutdown`, and hands every message on to `mcp-engine`. It runs no IngeTrazo itself.
 - **`mcp-engine`** (engine image, command `engine`, `ENGINE_MODE=mcp`): the IngeTrazo the gateway forwards to,
@@ -164,7 +163,7 @@ software (Mesa llvmpipe) inside an in-memory X server (Xvfb).
   paths only inside `/data`; it opens `INGETRAZO_MODEL` and saves if `INGETRAZO_ALLOW_SAVE`. No port, internal
   network only, bearer `MCP_ENGINE_TOKEN` (or its secret volume). If IngeTrazo exits, the container exits too and
   the restart policy brings it back.
-- **`viewer`** (viewer image): watches the model folders and has what is looked at rendered: a sheet as PNG, a
+- **`viewer`** (this image): watches the model folders and has what is looked at rendered: a sheet as PNG, a
   saved view as PNG, the sheets as one PDF, the model as GLB (glTF binary, for the 3D view), into the cache. It
   serves them as web pages, and server-sent events reload an open page when what it waits for is ready. It holds
   the users, shares, admin panel, render queue and cache; it runs no IngeTrazo itself.
@@ -175,11 +174,11 @@ software (Mesa llvmpipe) inside an in-memory X server (Xvfb).
   allows `run_python` (the viewer reads scene folders and cameras that way), so treat it like shell access to that
   container. Several engines render side by side: add `viewer-engine-2`, … and list them in `ENGINE_URLS`.
 
-Without `MCP_ENGINE_URL` / `ENGINE_URLS` the `mcp` and `viewer` commands of the engine image still run their own
-IngeTrazos (the viewer: `VIEWER_WORKERS`), all in one container, as before the split.
+The engine's API (`/call`, `/rpc`, `/healthz`) is described in [`mcp_http/remote.py`](mcp_http/remote.py); its side
+lives in ingetrazo-docker. Keep the two images on matching tags.
 
-Health: `GET /healthz` on both ports, used by the image's `HEALTHCHECK`. For the MCP service it checks that the
-IngeTrazo process is alive and that its bridge answers (`list_documents`). The check queues behind the MCP
+Health: `GET /healthz` on both ports, used by the image's `HEALTHCHECK`. The gateway passes on its engine's
+`/healthz`, which checks that the IngeTrazo process is alive and that its bridge answers (`list_documents`). The check queues behind the MCP
 requests, because the bridge works one request at a time; during a long tool call it reports `busy`. `/healthz` of
 the viewer needs no login in any mode.
 
@@ -234,7 +233,7 @@ takes a while. So the viewer renders what someone looks at, keeps it, and does t
 - **One queue** does it all, most urgent first: what a user waits for, then the neighbours and recently viewed,
   then previews, then (`all`) everything else: the saved views, then the sheets, then the 3D model, and the PDF of
   all sheets last, once nothing else waits. A task that has started is not interrupted: a click waits for it.
-- **Render workers** (one per engine in `ENGINE_URLS`, or `VIEWER_WORKERS` without engines; default 1): that many
+- **Render workers** (one per engine in `ENGINE_URLS`, default 1): that many
   IngeTrazos take tasks from the queue side by side, so a click does not wait behind a long render. Each one is a whole app (memory, a few seconds to start), and in
   software rendering it needs CPU cores of its own: more workers than free cores only make each render slower.
   Mesa's renderer uses several threads per app; `LP_NUM_THREADS` (e.g. cores ÷ workers) caps them.
@@ -411,8 +410,8 @@ Contributions are welcome. Commits need a DCO sign-off (`git commit -s`); see
 
 ## License
 
-AGPL-3.0-or-later (see [LICENSE](LICENSE)). The IngeTrazo inside the image stays under its own
-GPL-3.0-or-later; section 13 of the AGPL allows the combination.
+AGPL-3.0-or-later (see [LICENSE](LICENSE)). This image contains no IngeTrazo; the engines it talks to (IngeTrazo,
+GPL-3.0-or-later, in ingetrazo-docker's image) are separate programs.
 
 If you run a modified version as a network service, the AGPL asks you to offer its users the
 source of that version.

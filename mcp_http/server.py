@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-"""MCP over Streamable HTTP for a headless IngeTrazo.
+"""The MCP gateway: MCP over Streamable HTTP for a headless IngeTrazo.
 
 ``POST /mcp`` takes JSON-RPC and answers with JSON (the stateless form of
 the Streamable HTTP transport); ``GET /mcp`` offers no server-initiated
 stream (405). ``GET /healthz`` is the container's health probe.
 
-Every request goes to IngeTrazo's own MCP handler (scripts/ingetrazo_mcp.py),
-so the tools and their descriptions are the app's. The container adds:
+Every request goes to IngeTrazo's own MCP handler (scripts/ingetrazo_mcp.py)
+in an engine (``MCP_ENGINE_URL``, an ingetrazo-docker container with
+``ENGINE_MODE=mcp`` on an internal network), so the tools and their
+descriptions are the app's. The gateway adds:
 ``list_documents`` (the model folders and their files), the confinement of
 file paths to the model folders (writing only into read/write ones, see
 folders.py), and hides ``shutdown`` (the container's lifetime is the
@@ -19,11 +21,8 @@ may read, and save and export only where they may write. ``run_python``
 file, which would make the folders meaningless. There is one IngeTrazo
 and one open document for every caller.
 
-In the viewer image (no IngeTrazo) this is the MCP gateway: with
-``MCP_ENGINE_URL`` every message and bridge call goes to an engine in
-``mcp`` mode (mcp_http/engine_server.py) on an internal network, and the
-users, OAuth and folder rights stay here. Without it, as in the engine
-image, IngeTrazo runs in this container.
+The users, OAuth and folder rights stay here; the engine knows only its
+service token.
 """
 from __future__ import annotations
 
@@ -39,7 +38,7 @@ from urllib.parse import urlsplit
 from pathlib import Path
 
 from . import folders, shares
-from .appbridge import DATA_DIR, App, env_flag, initial_model, log
+from .common import DATA_DIR, log
 from .auth import FULL, Auth, Caller
 from .remote import RemoteApp, mcp_engine_url
 
@@ -72,7 +71,7 @@ LIST_DOCUMENTS = {
     "inputSchema": {"type": "object", "properties": {}},
 }
 
-app: App | RemoteApp
+app: RemoteApp
 auth: Auth
 MAX_BUSY = float(os.environ.get("HEALTH_MAX_BUSY_SECONDS") or 900)
 
@@ -199,7 +198,7 @@ def _handle(msg: dict, caller: Caller = FULL) -> dict | None:
         result = reply.setdefault("result", {})
         if wanted in KNOWN_VERSIONS:
             result["protocolVersion"] = wanted
-        result["serverInfo"] = {"name": "ingetrazo-docker", "version": "0.1.0"}
+        result["serverInfo"] = {"name": "ingetrazo-web-viewer", "version": "0.1.0"}
     elif method == "tools/list":
         # The app's list_documents gives way to the container's, which
         # includes it.
@@ -211,7 +210,7 @@ def _handle(msg: dict, caller: Caller = FULL) -> dict | None:
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    server_version = "ingetrazo-docker"
+    server_version = "ingetrazo-web-viewer"
 
     # ---- plumbing -------------------------------------------------------------
     def log_message(self, fmt, *args):          # one quiet line per request
@@ -338,7 +337,10 @@ def main() -> None:
     global app, auth
     auth = Auth()
     engine = mcp_engine_url()
-    app = RemoteApp(engine) if engine else App()
+    if not engine:
+        raise SystemExit("MCP_ENGINE_URL must name the engine (an ingetrazo-docker "
+                         "container with ENGINE_MODE=mcp), e.g. http://mcp-engine:8766")
+    app = RemoteApp(engine)
     port = int(os.environ.get("MCP_PORT", 8765))
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     server.daemon_threads = True
@@ -346,14 +348,9 @@ def main() -> None:
     import threading
     threading.Thread(target=server.serve_forever, name="http",
                      daemon=True).start()
-    log(f"MCP endpoint on :{port}/mcp (auth: {auth.mode}"
-        + (f", engine {engine}" if engine else "") + "); model folders: "
-        + "; ".join(f.describe() for f in folders.FOLDERS))
-    if isinstance(app, RemoteApp):
-        app.start()             # the engine opens INGETRAZO_MODEL, saves or not
-    else:
-        app.start(initial_model(), allow_save=env_flag("INGETRAZO_ALLOW_SAVE", True),
-                  save_format=os.environ.get("INGETRAZO_SAVE_FORMAT") or None)
+    log(f"MCP endpoint on :{port}/mcp (auth: {auth.mode}, engine {engine}); "
+        "model folders: " + "; ".join(f.describe() for f in folders.FOLDERS))
+    app.start()                 # the engine opens INGETRAZO_MODEL, saves or not
     while True:
         time.sleep(3600)
 

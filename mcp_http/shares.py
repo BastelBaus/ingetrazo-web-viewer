@@ -88,7 +88,7 @@ def defaults() -> list[dict]:
     try:
         return parse(os.environ.get("DEFAULT_SHARES", f"{ALL}:r"))
     except ValueError as exc:
-        raise SystemExit(f"[ingetrazo-docker] DEFAULT_SHARES: {exc}") from None
+        raise SystemExit(f"[ingetrazo-web-viewer] DEFAULT_SHARES: {exc}") from None
 
 
 def validate(shares: list) -> list[dict]:

@@ -22,7 +22,7 @@ import hmac
 import os
 from dataclasses import dataclass
 
-from .appbridge import log
+from .common import log
 from .users import Account, Users
 
 MODES = ("none", "token", "oauth")

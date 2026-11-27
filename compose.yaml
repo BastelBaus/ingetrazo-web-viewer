@@ -1,15 +1,15 @@
-# IngeTrazo in containers.
+# The IngeTrazo web viewer and MCP gateway, with their engines.
 #
-#   docker compose up -d                       # MCP server only
+#   docker compose up -d                       # MCP gateway only
 #   docker compose --profile viewer up -d      # + the live web viewer
 #
 # Two images:
-#   viewer image  mcp (the MCP gateway) and viewer: users, OAuth, folder
-#                 rights, pages; no IngeTrazo
-#   engine image  mcp-engine and viewer-engine: IngeTrazo headless, on an
-#                 internal network only
+#   ingetrazo-web-viewer (this repo)  mcp (the MCP gateway) and viewer:
+#       users, OAuth, folder rights, pages; no IngeTrazo
+#   ingetrazo (BastelBaus/ingetrazo-docker)  mcp-engine and viewer-engine:
+#       IngeTrazo headless, on an internal network only
 # Each engine makes its secret on first start in a volume it shares with
-# its service (or set ENGINE_TOKEN).
+# its service (or set MCP_ENGINE_TOKEN / ENGINE_TOKEN).
 #
 # Settings come from .env (copy .env.example). Models live in ./data
 # (or INGETRAZO_DATA_DIR); every service sees the same folder.
@@ -17,35 +17,32 @@
 # .env and their bind mounts in compose.override.yaml (see
 # compose.folders.example.yaml and the README).
 
-x-image: &image
+x-engine: &engine
   image: ${INGETRAZO_IMAGE:-ghcr.io/bastelbaus/ingetrazo:latest}
-  build:
-    context: .
-    args:
-      INGETRAZO_REPO: ${INGETRAZO_REPO:-https://github.com/BastelBaus/ingetrazo}
-      INGETRAZO_REF: ${INGETRAZO_REF:-187e43f9bc85a28b513f1d0b3f9c68a55dbf47a4}
-      INGETRAZO_DOCKER_REF: ${INGETRAZO_DOCKER_REF:-dev}
-    target: engine
   restart: unless-stopped
   init: false            # tini is the image's entrypoint already
   shm_size: 256m
+  command: ["engine"]
+  networks: [engine]
+
+x-web: &web
+  image: ${WEB_VIEWER_IMAGE:-ghcr.io/bastelbaus/ingetrazo-web-viewer:latest}
+  build:
+    context: .
+    args:
+      WEB_VIEWER_REF: ${WEB_VIEWER_REF:-dev}
+  restart: unless-stopped
+  init: false
+  networks: [default, engine]
 
 services:
   # The MCP gateway: what AI clients reach. Checks tokens / OAuth and each
   # user's folders, then forwards to mcp-engine.
   mcp:
-    image: ${VIEWER_IMAGE:-ghcr.io/bastelbaus/ingetrazo-viewer:latest}
-    build:
-      context: .
-      target: viewer
-      args:
-        INGETRAZO_DOCKER_REF: ${INGETRAZO_DOCKER_REF:-dev}
-    restart: unless-stopped
-    init: false
+    <<: *web
     command: ["mcp"]
     depends_on:
       - mcp-engine
-    networks: [default, engine]
     ports:
       - "${MCP_BIND:-127.0.0.1}:${MCP_PORT:-8765}:8765"
     environment:
@@ -78,9 +75,7 @@ services:
   # IngeTrazo for the MCP gateway: every tool but shutdown, paths inside
   # /data. Only on the internal network, no port.
   mcp-engine:
-    <<: *image
-    command: ["engine"]
-    networks: [engine]
+    <<: *engine
     environment:
       ENGINE_MODE: mcp
       HEALTH_PORT: "8766"
@@ -101,19 +96,11 @@ services:
       - mcp-engine-secret:/engine
 
   viewer:
-    image: ${VIEWER_IMAGE:-ghcr.io/bastelbaus/ingetrazo-viewer:latest}
-    build:
-      context: .
-      target: viewer
-      args:
-        INGETRAZO_DOCKER_REF: ${INGETRAZO_DOCKER_REF:-dev}
-    restart: unless-stopped
-    init: false
+    <<: *web
     profiles: ["viewer"]
     command: ["viewer"]
     depends_on:
       - viewer-engine
-    networks: [default, engine]
     ports:
       - "${VIEWER_BIND:-127.0.0.1}:${VIEWER_PORT:-8080}:8080"
     environment:
@@ -164,10 +151,8 @@ services:
   # IngeTrazo for the viewer: renders into the cache both mount at /cache.
   # Only on the internal network, no port; never saves a model.
   viewer-engine:
-    <<: *image
+    <<: *engine
     profiles: ["viewer"]
-    command: ["engine"]
-    networks: [engine]
     environment:
       HEALTH_PORT: "8766"
       ENGINE_TOKEN: ${VIEWER_ENGINE_TOKEN:-${ENGINE_TOKEN:-}}

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-"""IngeTrazos in other containers (engines, mcp_http/engine_server.py),
-for the services of the viewer image, which has no IngeTrazo, no X server
-and no OpenGL of its own.
+"""IngeTrazo in other containers: the engines of the ingetrazo-docker image
+(``engine`` command, https://github.com/BastelBaus/ingetrazo-docker). This
+image has no IngeTrazo, no X server and no OpenGL of its own.
 
 - The viewer: ``ENGINE_URLS`` (comma-separated, e.g.
   ``http://viewer-engine:8766``), one render engine per render worker. The
@@ -9,12 +9,17 @@ and no OpenGL of its own.
 - The MCP gateway: ``MCP_ENGINE_URL``, one engine in ``mcp`` mode.
 
 ``ENGINE_TOKEN`` is the shared secret the engines check, or
-``ENGINE_TOKEN_FILE`` where the engine wrote it. Without these URLs each
-service starts its own IngeTrazo as before, which only works in the engine
-image.
+``ENGINE_TOKEN_FILE`` where the engine wrote it (a volume both mount).
 
-``RemoteApp`` has what the services use of ``mcp_http.appbridge.App``:
-``start``, ``alive``, ``call``, ``handle`` and ``probe``.
+The engine's API (its side: ingetrazo-docker's mcp_http/engine_server.py):
+
+``POST /call``  ``{"tool", "args", "timeout"?}`` → the IngeTrazo bridge's
+  reply ``{"ok", "result" | "error"}``.
+``POST /rpc``  one MCP JSON-RPC message (``ENGINE_MODE=mcp``) → its reply.
+``GET /healthz``  ``{"status": "ok" | "busy" | ...}``.
+
+``RemoteApp`` is one engine: ``start``, ``alive``, ``call``, ``handle`` and
+``probe``.
 """
 from __future__ import annotations
 
@@ -24,8 +29,27 @@ import time
 import urllib.error
 import urllib.request
 
-from .appbridge import ai_timeout, log
-from .engine_server import MIN_TOKEN, engine_token
+from pathlib import Path
+
+from .common import ai_timeout, log
+
+MIN_TOKEN = 16
+
+
+def engine_token() -> str:
+    """The shared secret: ``ENGINE_TOKEN``, or else the file
+    ``ENGINE_TOKEN_FILE`` names (the engine makes it on its first start).
+    "" when there is none yet."""
+    token = os.environ.get("ENGINE_TOKEN", "").strip()
+    if token:
+        return token
+    name = os.environ.get("ENGINE_TOKEN_FILE", "").strip()
+    if not name:
+        return ""
+    try:
+        return Path(name).read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return ""
 
 #: How long the viewer waits for an engine to come up at start.
 START_WAIT = float(os.environ.get("ENGINE_START_SECONDS") or 600)
@@ -64,7 +88,7 @@ def engine_urls() -> list[str]:
 
 class RemoteApp:
     """One render engine, reached over HTTP. One call at a time per engine
-    (the renderer gives each worker its own engine), like a local App."""
+    (the renderer gives each worker its own engine)."""
 
     def __init__(self, url: str, token: str | None = None) -> None:
         self.url = url.rstrip("/")

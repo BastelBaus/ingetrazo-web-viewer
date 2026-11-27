@@ -1,6 +1,5 @@
-# Build both images and publish them to the GitHub Container Registry:
-# ghcr.io/<owner>/ingetrazo (engine) and ghcr.io/<owner>/ingetrazo-viewer,
-# with the same tags.
+# Build the image and publish it to the GitHub Container Registry as
+# ghcr.io/<owner>/ingetrazo-web-viewer.
 #
 #   push to dev            -> :dev, :dev-<sha>                  (amd64)
 #   manual run on a branch -> :br-<branch>                      (amd64)
@@ -48,7 +47,7 @@ jobs:
           OWNER: ${{ github.repository_owner }}
         run: |
           set -euo pipefail
-          image="ghcr.io/${OWNER,,}/ingetrazo"
+          image="ghcr.io/${OWNER,,}/ingetrazo-web-viewer"
           sha="${GITHUB_SHA::7}"
           platforms=linux/amd64
           if [[ $REF_TYPE == tag ]]; then
@@ -76,21 +75,11 @@ jobs:
             echo "platforms=$platforms"
             echo "version=$version"
             echo "image=$image"
-            echo "viewer_image=$image-viewer"
             echo "tags<<EOF"
             for t in "${tags[@]}"; do echo "$image:$t"; done
             echo "EOF"
-            echo "viewer_tags<<EOF"
-            for t in "${tags[@]}"; do echo "$image-viewer:$t"; done
-            echo "EOF"
           } >> "$GITHUB_OUTPUT"
           printf 'Tags:\n'; printf '  %s\n' "${tags[@]}"
-
-      - name: IngeTrazo ref baked into the image
-        id: ref
-        run: |
-          echo "repo=$(sed -n 's/^ARG INGETRAZO_REPO=//p' Dockerfile)" >> "$GITHUB_OUTPUT"
-          echo "ref=$(sed -n 's/^ARG INGETRAZO_REF=//p' Dockerfile)" >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-qemu-action@v4
         if: contains(steps.plan.outputs.platforms, 'arm64')
@@ -108,25 +97,22 @@ jobs:
         with:
           images: ${{ steps.plan.outputs.image }}
           labels: |
-            org.opencontainers.image.title=IngeTrazo (headless)
-            org.opencontainers.image.description=IngeTrazo headless: MCP over HTTP and a live sheet/view viewer
+            org.opencontainers.image.title=IngeTrazo web viewer
+            org.opencontainers.image.description=Web viewer and MCP gateway for IngeTrazo: users, OAuth, folder rights; renders through ingetrazo-docker engines
             org.opencontainers.image.licenses=AGPL-3.0-or-later
             org.opencontainers.image.version=${{ steps.plan.outputs.version }}
-            io.github.ingetrazo.repo=${{ steps.ref.outputs.repo }}
-            io.github.ingetrazo.ref=${{ steps.ref.outputs.ref }}
 
-      - name: Build and push (engine)
+      - name: Build and push
         uses: docker/build-push-action@v7
         with:
           context: .
-          target: engine
           platforms: ${{ steps.plan.outputs.platforms }}
           push: true
           tags: ${{ steps.plan.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           annotations: ${{ steps.meta.outputs.annotations }}
           build-args: |
-            INGETRAZO_DOCKER_REF=${{ steps.plan.outputs.version }}
+            WEB_VIEWER_REF=${{ steps.plan.outputs.version }}
           cache-from: |
             type=gha,scope=amd64
             type=gha,scope=release
@@ -134,38 +120,8 @@ jobs:
           provenance: true
           sbom: ${{ contains(steps.plan.outputs.platforms, 'arm64') }}
 
-      - id: meta_viewer
-        uses: docker/metadata-action@v6
-        with:
-          images: ${{ steps.plan.outputs.viewer_image }}
-          labels: |
-            org.opencontainers.image.title=IngeTrazo viewer
-            org.opencontainers.image.description=Live web viewer of IngeTrazo sheets, views and 3D models; renders through the ingetrazo engine image
-            org.opencontainers.image.licenses=AGPL-3.0-or-later
-            org.opencontainers.image.version=${{ steps.plan.outputs.version }}
-
-      - name: Build and push (viewer)
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          target: viewer
-          platforms: ${{ steps.plan.outputs.platforms }}
-          push: true
-          tags: ${{ steps.plan.outputs.viewer_tags }}
-          labels: ${{ steps.meta_viewer.outputs.labels }}
-          annotations: ${{ steps.meta_viewer.outputs.annotations }}
-          build-args: |
-            INGETRAZO_DOCKER_REF=${{ steps.plan.outputs.version }}
-          cache-from: |
-            type=gha,scope=viewer-amd64
-            type=gha,scope=viewer-release
-          cache-to: ${{ contains(steps.plan.outputs.platforms, 'arm64') && 'type=gha,scope=viewer-release,mode=max' || 'type=gha,scope=viewer-amd64,mode=max' }}
-          provenance: true
-          sbom: ${{ contains(steps.plan.outputs.platforms, 'arm64') }}
-
       - name: Summary
         env:
           TAGS: ${{ steps.plan.outputs.tags }}
-          VIEWER_TAGS: ${{ steps.plan.outputs.viewer_tags }}
         run: |
-          { echo "### Published"; echo; echo '```'; echo "$TAGS"; echo "$VIEWER_TAGS"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          { echo "### Published"; echo; echo '```'; echo "$TAGS"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"

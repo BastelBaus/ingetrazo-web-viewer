@@ -34,14 +34,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
 from mcp_http import folders, shares
-from mcp_http.appbridge import App, log
+from mcp_http.common import log
 from mcp_http.users import UserError
 
 from . import admin, avatar, site, version
 from mcp_http.remote import RemoteApp, engine_urls
 from .auth import Auth, User
 from .render import (BACKGROUND, CACHE_DIR, GLB_MAX_MB, NEXT, NOW, POLL, PRERENDER, PREVIEW,
-                     WITH_PDF, WORKERS, Renderer)
+                     WITH_PDF, Renderer)
 from .view3d import THREE_DIR, view3d
 
 renderer: Renderer
@@ -1187,17 +1187,12 @@ def main() -> None:
     global renderer, auth
     auth = Auth()                    # a wrong setting stops here, before IngeTrazo
     urls = engine_urls()
-    if urls:
-        # Render engines in their own containers (ENGINE_URLS): one worker
-        # each; this container runs no IngeTrazo.
-        apps = [RemoteApp(u) for u in urls]
-        where = "engines " + ", ".join(urls)
-    else:
-        # One IngeTrazo per render worker, each with its own copy of the
-        # client script (its own port and child process).
-        apps = [App() if n == 1 else App(f"ingetrazo_mcp_w{n}")
-                for n in range(1, WORKERS + 1)]
-        where = f"render workers: {WORKERS}"
+    if not urls:
+        raise SystemExit("ENGINE_URLS must name the render engine(s) (ingetrazo-docker "
+                         "containers, command engine), e.g. http://viewer-engine:8766")
+    # One render worker per engine; this container runs no IngeTrazo.
+    apps = [RemoteApp(u) for u in urls]
+    where = "engines " + ", ".join(urls)
     renderer = Renderer(apps)
     port = int(os.environ.get("VIEWER_PORT", 8080))
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
@@ -1207,10 +1202,7 @@ def main() -> None:
         f"prerender {PRERENDER}; {where}; model folders: "
         + "; ".join(f.describe() for f in folders.FOLDERS))
     for app in apps:
-        if isinstance(app, RemoteApp):
-            app.start()
-        else:
-            app.start(None, allow_save=False)
+        app.start()
     renderer.run()
 
 

@@ -11,7 +11,7 @@ import os
 import threading
 from pathlib import Path
 
-DEFAULT_TITLE = os.environ.get("VIEWER_TITLE", "").strip() or "IngeTrazo-docker"
+DEFAULT_TITLE = os.environ.get("VIEWER_TITLE", "").strip() or "IngeTrazo"
 MAX_TITLE = 80
 
 _lock = threading.Lock()

@@ -2,8 +2,8 @@
 """Renders the models of the model folders, on demand, and keeps what it
 rendered.
 
-Read-only headless IngeTrazos (no --allow-save) do the work:
-``VIEWER_WORKERS`` of them (default 1), each one task at a time, all from
+Read-only headless IngeTrazos in render engines (``ENGINE_URLS``, one
+render worker per engine) do the work, each one task at a time, all from
 one queue with priorities:
 
 1. ``NOW``: what a user is waiting for: the model's listing, the sheet or
@@ -51,7 +51,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from mcp_http import folders
-from mcp_http.appbridge import DATA_DIR, App, log
+from mcp_http.common import DATA_DIR, log
+from mcp_http.remote import RemoteApp
 
 CACHE_DIR = Path(os.environ.get("INGETRAZO_CACHE", "/cache"))
 POLL = float(os.environ.get("VIEWER_POLL_SECONDS", 3))
@@ -73,20 +74,6 @@ if PRERENDER not in ("all", "previews", "none"):
 RECENT = float(os.environ.get("VIEWER_RECENT_MINUTES", 30)) * 60
 
 
-def _workers() -> int:
-    raw = os.environ.get("VIEWER_WORKERS", "").strip() or "1"
-    try:
-        n = int(raw)
-    except ValueError:
-        raise SystemExit(f"VIEWER_WORKERS must be a whole number, not {raw!r}") from None
-    if not 1 <= n <= 16:
-        raise SystemExit(f"VIEWER_WORKERS must be between 1 and 16, not {n}")
-    return n
-
-
-#: How many IngeTrazos render side by side; each is a whole app (memory,
-#: a few seconds to start) and, in software rendering, wants CPU cores.
-WORKERS = _workers()
 
 #: Bumped when index.json changes shape: a model listed by an older viewer
 #: is listed again, even though its file is unchanged.
@@ -261,7 +248,7 @@ class RenderQueue:
 
 
 class Renderer:
-    def __init__(self, apps: App | list[App]) -> None:
+    def __init__(self, apps: RemoteApp | list[RemoteApp]) -> None:
         self.apps = list(apps) if isinstance(apps, (list, tuple)) else [apps]
         self.app = self.apps[0]
         self.workers = [_Worker(i + 1, a) for i, a in enumerate(self.apps)]

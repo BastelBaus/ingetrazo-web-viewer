@@ -8,7 +8,7 @@ feature/*, fix/* --PR--> dev --> release/vX.Y --PR--> main --> tag vX.Y.Z
 hotfix/* (from main) --PR--> main --> tag vX.Y.Z+1 --> back-merge into dev
 ```
 
-| Branch / tag | What it is | Images (`ghcr.io/bastelbaus/ingetrazo` and `…/ingetrazo-viewer`, same tags) |
+| Branch / tag | What it is | Image (`ghcr.io/bastelbaus/ingetrazo-web-viewer`) |
 |---|---|---|
 | `dev` | Integration branch, default branch, target of all feature PRs | `:dev`, `:dev-<sha>` (amd64) |
 | any branch, manual *Publish* run | Try a branch in a container | `:br-<branch>` (amd64) |

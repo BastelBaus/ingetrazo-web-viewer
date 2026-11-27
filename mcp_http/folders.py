@@ -177,7 +177,7 @@ def from_env() -> list[Folder]:
                      _int(os.environ.get("MODEL_SCAN_DEPTH", ""), "MODEL_SCAN_DEPTH"),
                      _globs(os.environ.get("MODEL_EXCLUDE", "")))
     except ValueError as exc:
-        raise SystemExit(f"[ingetrazo-docker] {exc}") from None
+        raise SystemExit(f"[ingetrazo-web-viewer] {exc}") from None
 
 
 FOLDERS: list[Folder] = from_env()

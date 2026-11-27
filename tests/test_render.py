@@ -270,22 +270,6 @@ class RenderTest(Base):
         listings = sum(1 for a in apps for t, _ in a.calls if t == "list_sheets")
         self.assertEqual(listings, 1)                                 # listed once
 
-    def test_workers_setting(self):
-        saved = os.environ.get("VIEWER_WORKERS")
-        try:
-            for raw, want in (("", 1), ("3", 3)):
-                os.environ["VIEWER_WORKERS"] = raw
-                self.assertEqual(render._workers(), want)
-            for raw in ("0", "x", "17"):
-                os.environ["VIEWER_WORKERS"] = raw
-                with self.assertRaises(SystemExit):
-                    render._workers()
-        finally:
-            if saved is None:
-                os.environ.pop("VIEWER_WORKERS", None)
-            else:
-                os.environ["VIEWER_WORKERS"] = saved
-
     def test_removed_model_drops_its_cache(self):
         self.r._scan()
         self.drain()

@@ -1,14 +1,12 @@
-# Build both images (engine, viewer) and run the end-to-end smoke test
-# (MCP, viewer with its own IngeTrazo, and viewer image + render engine).
-# "upstream" builds the engine from IngeTrazo's newest release instead of
-# the fork: informational, it shows when the container can switch
-# (ingelibre/ingetrazo#1717).
+# Unit tests, build the image and run the end-to-end smoke test: the MCP
+# gateway and the viewer in every login mode, each with its engine (the
+# ingetrazo-docker image, ENGINE_IMAGE: the repo variable, or :dev).
 name: CI
 
 on:
   pull_request:
   workflow_dispatch:
-  workflow_call:          # release.yml runs it on main and tags, before publishing
+  workflow_call:          # publish.yml runs it before publishing
 
 permissions:
   contents: read
@@ -22,116 +20,34 @@ jobs:
     name: smoke
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    env:
+      ENGINE_IMAGE: ${{ vars.ENGINE_IMAGE || 'ghcr.io/bastelbaus/ingetrazo:dev' }}
     steps:
       - uses: actions/checkout@v7
 
       - name: Lint shell scripts
         run: shellcheck entrypoint.sh tests/smoke.sh
 
-      - name: Unit tests (model folders, render queue, viewer pages)
+      - name: Unit tests (users, rights, folders, render queue, pages, engine client)
         run: python3 -m unittest discover -s tests -p "test_*.py" -v
 
       - uses: docker/setup-buildx-action@v4
 
-      - name: Build engine image (amd64)
+      - name: Build image (amd64)
         uses: docker/build-push-action@v7
         with:
           context: .
-          target: engine
           load: true
-          tags: ingetrazo-docker:ci
+          tags: ingetrazo-web-viewer:ci
           cache-from: type=gha,scope=amd64
           cache-to: type=gha,scope=amd64,mode=max
 
-      - name: Build viewer image (amd64)
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          target: viewer
-          load: true
-          tags: ingetrazo-viewer:ci
-          cache-from: |
-            type=gha,scope=amd64
-            type=gha,scope=viewer-amd64
-          cache-to: type=gha,scope=viewer-amd64,mode=max
+      - name: Pull the engine image
+        run: |
+          docker pull "$ENGINE_IMAGE"
+          echo "### Engine: \`$ENGINE_IMAGE\` ($(docker run --rm --entrypoint cat "$ENGINE_IMAGE" /opt/ingetrazo/BUILD_REF))" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Smoke test
         env:
-          IMAGE: ingetrazo-docker:ci
-          VIEWER_IMAGE: ingetrazo-viewer:ci
-        run: tests/smoke.sh
-
-      - name: Validate compose file
-        env:
-          MCP_TOKEN: ci-dummy-token-0123456789
-        run: |
-          docker compose --profile viewer config -q
-          docker compose -f compose.yaml -f compose.folders.example.yaml --profile viewer config -q
-
-  # IngeTrazo's newest upstream release instead of the fork: does it have
-  # what the container needs (tests/upstream_ready.py)? Green with a warning
-  # while it does not; once it does, the full smoke test runs on it too.
-  upstream:
-    name: upstream (informational)
-    runs-on: ubuntu-24.04
-    timeout-minutes: 45
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Newest upstream release
-        id: up
-        run: |
-          set -euo pipefail
-          tag=$(git ls-remote --tags --refs https://github.com/ingelibre/ingetrazo 'v*' \
-                | sed 's#.*refs/tags/##' | grep -E '^v[0-9]+(\.[0-9]+)+$' | sort -V | tail -1)
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-
-      - uses: docker/setup-buildx-action@v4
-
-      - name: Build engine image on upstream
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          target: engine
-          load: true
-          tags: ingetrazo-docker:upstream
-          build-args: |
-            INGETRAZO_REPO=https://github.com/ingelibre/ingetrazo
-            INGETRAZO_REF=${{ steps.up.outputs.tag }}
-          cache-from: type=gha,scope=amd64
-
-      - name: Ready to switch?
-        id: ready
-        env:
-          TAG: ${{ steps.up.outputs.tag }}
-        run: |
-          set +e -uo pipefail   # a NOT READY exit code is reported, not fatal
-          out=$(docker run --rm -v "$PWD/tests:/tests:ro" --entrypoint python \
-                ingetrazo-docker:upstream /tests/upstream_ready.py /opt/ingetrazo)
-          code=$?
-          echo "$out"
-          { echo "### Upstream IngeTrazo $TAG"; echo; echo "$out"; } >> "$GITHUB_STEP_SUMMARY"
-          if [ $code -eq 0 ]; then
-            echo "ready=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "ready=false" >> "$GITHUB_OUTPUT"
-            echo "::warning title=Upstream not ready::IngeTrazo $TAG lacks what the container needs (ingelibre/ingetrazo#1717); smoke test skipped"
-          fi
-
-      - name: Build viewer image
-        if: steps.ready.outputs.ready == 'true'
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          target: viewer
-          load: true
-          tags: ingetrazo-viewer:upstream
-          cache-from: type=gha,scope=viewer-amd64
-
-      - name: Smoke test
-        if: steps.ready.outputs.ready == 'true'
-        env:
-          IMAGE: ingetrazo-docker:upstream
-          VIEWER_IMAGE: ingetrazo-viewer:upstream
+          IMAGE: ingetrazo-web-viewer:ci
         run: tests/smoke.sh

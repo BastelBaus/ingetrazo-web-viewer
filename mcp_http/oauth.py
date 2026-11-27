@@ -33,7 +33,7 @@ from html import escape
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlsplit
 
-from .appbridge import log
+from .common import log
 
 STATE_DIR = Path(os.environ.get("INGETRAZO_STATE", "/state"))
 #: claude.ai's and claude.com's connector callbacks, and any port on this

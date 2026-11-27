@@ -41,7 +41,7 @@ from pathlib import Path
 from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
 
-from mcp_http.appbridge import log
+from mcp_http.common import log
 from mcp_http.users import Account, UserError, Users
 
 MODES = ("local", "none", "oidc", "proxy")

@@ -22,7 +22,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        package: [ingetrazo, ingetrazo-viewer]
+        package: [ingetrazo-web-viewer]
     steps:
       - uses: dataaxiom/ghcr-cleanup-action@v1
         with:
