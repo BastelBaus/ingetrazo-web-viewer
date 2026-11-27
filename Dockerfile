@@ -13,7 +13,7 @@
 # ---- three.js for the viewer's 3D view ------------------------------------------
 # A pinned release (MIT), checked against its SHA-256, served by the viewer
 # itself (no CDN at view time).
-FROM python:3.12-slim-bookworm AS three
+FROM python:3.15-slim-bookworm AS three
 RUN apt-get update \
  && apt-get install -y --no-install-recommends curl ca-certificates \
  && rm -rf /var/lib/apt/lists/*
@@ -30,7 +30,7 @@ RUN set -e; \
     fetch LICENSE LICENSE 4c40a1ef62450b857c3b2aaf294936304cd552d965fbcd9d32d4c5bcf4ba4454
 
 # ---- the image ---------------------------------------------------------------------
-FROM python:3.12-slim-bookworm
+FROM python:3.15-slim-bookworm
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
