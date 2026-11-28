@@ -18,7 +18,9 @@ folders. It may use the web viewer only, never the MCP server, and is
 never an admin; it may expire on a date, and an admin can switch it off,
 replace its link (the old one stops working) or remove it.
 
-Passwords are stored as scrypt hashes. The schema carries its version in
+Passwords are stored as scrypt hashes. Tokens (MCP and access links) are
+checked by their SHA-256 hash; an encrypted copy (mcp_http/vault.py, key
+outside the database) lets their owner see them again. The schema carries its version in
 ``PRAGMA user_version``; newer versions add columns (``MIGRATIONS``).
 """
 from __future__ import annotations
@@ -35,6 +37,8 @@ import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+
+from . import vault
 
 ROLES = ("admin", "user")
 SOURCES = ("local", "oidc", "proxy", "guest", "link")
@@ -85,6 +89,9 @@ MIGRATIONS: list[str | list[str]] = [
     # an access link's secret), and the last day an account may log in.
     ["ALTER TABLE tokens ADD COLUMN kind TEXT NOT NULL DEFAULT 'mcp'",
      "ALTER TABLE users ADD COLUMN expires TEXT"],
+    # 8: the token, encrypted (mcp_http/vault.py), so it can be shown again;
+    # NULL for older tokens until their next use.
+    "ALTER TABLE tokens ADD COLUMN secret TEXT",
 ]
 #: A personal MCP token starts with this, so it is recognisable in a config.
 TOKEN_PREFIX = "itz_"
@@ -201,6 +208,7 @@ class Users:
         self._db.row_factory = sqlite3.Row
         self._db.execute("PRAGMA journal_mode=WAL")
         self._migrate()
+        self._vault = vault.Vault(vault.load_key(self.path))
 
     def _migrate(self) -> None:
         with self._lock:
@@ -485,15 +493,18 @@ class Users:
         return hashlib.sha256(token.encode()).hexdigest()
 
     def create_token(self, name: str, label: str = "") -> str:
-        """A new MCP access token for ``name``; shown once, kept hashed."""
+        """A new MCP access token for ``name``; kept hashed, and encrypted
+        so its owner can see it again (``show_token``)."""
         acc = self._require(name)
         if not acc.mcp:
             raise UserError(f"{acc.name} may not use the MCP server")
         token = TOKEN_PREFIX + secrets.token_urlsafe(32)
         with self._lock:
-            self._db.execute("INSERT INTO tokens (hash, user, label, created, kind) "
-                             "VALUES (?, ?, ?, ?, 'mcp')",
-                             (self._token_hash(token), acc.name, label.strip()[:64], _now()))
+            key = self._token_hash(token)
+            self._db.execute("INSERT INTO tokens (hash, user, label, created, kind, secret) "
+                             "VALUES (?, ?, ?, ?, 'mcp', ?)",
+                             (key, acc.name, label.strip()[:64], _now(),
+                              self._vault.seal(token, key)))
         return token
 
     def tokens(self, name: str) -> list[dict]:
@@ -503,7 +514,30 @@ class Users:
                                     "ORDER BY created",
                                     (name,)).fetchall()
         return [{"id": r["hash"][:12], "label": r["label"], "created": r["created"],
-                 "last_used": r["last_used"]} for r in rows]
+                 "last_used": r["last_used"],
+                 "shown": self._vault.open(r["secret"], r["hash"]) is not None}
+                for r in rows]
+
+    def show_token(self, name: str, token_id: str) -> str | None:
+        """One of ``name``'s MCP tokens again; None when there is no such
+        token or no readable copy of it (made before, or another key)."""
+        if not re.fullmatch(r"[0-9a-f]{12}", token_id or ""):
+            return None
+        with self._lock:
+            row = self._db.execute("SELECT hash, secret FROM tokens WHERE user = ? "
+                                   "AND kind = 'mcp' AND hash LIKE ?",
+                                   (name, token_id + "%")).fetchone()
+        return None if row is None else self._vault.open(row["secret"], row["hash"])
+
+    def _used(self, key: str, token: str) -> None:
+        """A token was just used: note when, and keep a readable copy if
+        there is none (an older token, or a new key). Under the lock."""
+        row = self._db.execute("SELECT secret FROM tokens WHERE hash = ?", (key,)).fetchone()
+        if row is not None and self._vault.open(row["secret"], key) is None:
+            self._db.execute("UPDATE tokens SET last_used = ?, secret = ? WHERE hash = ?",
+                             (_now(), self._vault.seal(token, key), key))
+        else:
+            self._db.execute("UPDATE tokens SET last_used = ? WHERE hash = ?", (_now(), key))
 
     def revoke_token(self, name: str, token_id: str) -> bool:
         if not re.fullmatch(r"[0-9a-f]{12}", token_id or ""):
@@ -524,14 +558,14 @@ class Users:
                                    (key,)).fetchone()
             if row is None:
                 return None
-            self._db.execute("UPDATE tokens SET last_used = ? WHERE hash = ?", (_now(), key))
+            self._used(key, token)
         acc = self.get(row["user"])
         return acc if acc and acc.active and acc.mcp and acc.source not in SPECIAL else None
 
     # ---- access links (viewer only) --------------------------------------------------
     def create_link(self, name: str, expires: str | None = None) -> tuple[Account, str]:
         """A new access link: an account ``name`` (web viewer only, no
-        folders yet) and its token, shown once and kept hashed."""
+        folders yet) and its token, kept hashed and encrypted (``show_link``)."""
         name = " ".join(name.split())
         if not LINK_NAME.match(name):
             raise UserError("a link's name is 1–64 characters")
@@ -560,9 +594,10 @@ class Users:
         token = LINK_PREFIX + secrets.token_urlsafe(32)
         with self._lock:
             self._db.execute("DELETE FROM tokens WHERE user = ? AND kind = 'web'", (acc.name,))
-            self._db.execute("INSERT INTO tokens (hash, user, label, created, kind) "
-                             "VALUES (?, ?, '', ?, 'web')",
-                             (self._token_hash(token), acc.name, _now()))
+            key = self._token_hash(token)
+            self._db.execute("INSERT INTO tokens (hash, user, label, created, kind, secret) "
+                             "VALUES (?, ?, '', ?, 'web', ?)",
+                             (key, acc.name, _now(), self._vault.seal(token, key)))
         return token
 
     def set_expires(self, name: str, day: str | None) -> str | None:
@@ -578,8 +613,18 @@ class Users:
         with self._lock:
             row = self._db.execute("SELECT * FROM tokens WHERE user = ? AND kind = 'web'",
                                    (name,)).fetchone()
-        return None if row is None else {"id": row["hash"][:12], "created": row["created"],
-                                         "last_used": row["last_used"]}
+        return None if row is None else {
+            "id": row["hash"][:12], "created": row["created"], "last_used": row["last_used"],
+            "shown": self._vault.open(row["secret"], row["hash"]) is not None}
+
+    def show_link(self, name: str) -> str | None:
+        """An access link's current token again; None when there is none or
+        no readable copy of it (made before, or another key)."""
+        acc = self._link(name)
+        with self._lock:
+            row = self._db.execute("SELECT hash, secret FROM tokens WHERE user = ? "
+                                   "AND kind = 'web'", (acc.name,)).fetchone()
+        return None if row is None else self._vault.open(row["secret"], row["hash"])
 
     def by_link(self, token: str) -> tuple[Account, str] | None:
         """The access link a token opens, and its id, if it may in now
@@ -592,7 +637,7 @@ class Users:
                                    (key,)).fetchone()
             if row is None:
                 return None
-            self._db.execute("UPDATE tokens SET last_used = ? WHERE hash = ?", (_now(), key))
+            self._used(key, token)
         acc = self.get(row["user"])
         if not self.link_usable(acc):
             return None
