@@ -45,6 +45,9 @@ SPECIAL = ("guest", "link")
 GUEST = "guest"
 #: A name: letters, digits and . _ - @ (e-mail addresses from a provider).
 NAME = re.compile(r"^[\w.@+-]{1,64}$", re.UNICODE)
+#: An access link's name: free text (spaces too), 1–64 characters, no
+#: control characters; runs of white space become one space.
+LINK_NAME = re.compile(r"^[^\x00-\x1f\x7f]{1,64}$")
 MIN_PASSWORD = 8
 
 #: Each entry upgrades the schema by one version.
@@ -503,9 +506,9 @@ class Users:
     def create_link(self, name: str, expires: str | None = None) -> tuple[Account, str]:
         """A new access link: an account ``name`` (web viewer only, no
         folders yet) and its token, shown once and kept hashed."""
-        name = name.strip()
-        if not NAME.match(name):
-            raise UserError("a name is 1–64 letters, digits or . _ - @ +")
+        name = " ".join(name.split())
+        if not LINK_NAME.match(name):
+            raise UserError("a link's name is 1–64 characters")
         if name.lower() == GUEST:
             raise UserError(f"the name {GUEST!r} is kept for the guest user")
         day = _check_date(expires)

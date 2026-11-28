@@ -164,6 +164,15 @@ class UsersTest(unittest.TestCase):
         self.assertIsNone(self.users.by_link(newer))
         self.assertIsNone(self.users.link_info("meier"))
 
+    def test_access_link_names(self):
+        self.users.ensure_admin("boss", "secret-pass")
+        acc, token = self.users.create_link("  Schreinerei   Meier: Küche & Bad ")
+        self.assertEqual(acc.name, "Schreinerei Meier: Küche & Bad")
+        self.assertEqual(self.users.by_link(token)[0].name, acc.name)
+        for bad in ("", "   ", "x" * 65, "a\x00b"):
+            with self.assertRaises(UserError):
+                self.users.create_link(bad)
+
     def test_mcp_tokens_untouched_by_links(self):
         self.users.ensure_admin("boss", "secret-pass")
         mcp = self.users.create_token("boss", "desktop")
@@ -489,6 +498,24 @@ class ViewerLoginTest(unittest.TestCase):
                             "role": "user", "csrf": token}, boss)
         self.assertEqual(self.req("/account", cookie=link)[0], 403)
         self.assertEqual(self.req("/account", cookie=self.login("meier", "meier-pass"))[0], 200)
+
+    def test_access_link_free_name(self):
+        boss = self.login("boss", "boss-password")
+        token = self.csrf(self.req("/admin", cookie=boss)[2])
+        name = "Carpenter Meier: kitchen & <bath>"
+        status, _, page = self.req("/admin", {"action": "link_create", "name": name,
+                                              "csrf": token}, boss)
+        self.assertEqual(status, 200, page)
+        secret = re.search(r"/t/(itv_[\w-]+)", page).group(1)
+        self.assertIn("Carpenter Meier: kitchen &amp; &lt;bath&gt;", page)
+        self.assertNotIn("<bath>", page)
+        from urllib.parse import quote
+        self.assertEqual(self.req("/admin/shares?name=" + quote(name), cookie=boss)[0], 200)
+        link = self.req("/t/" + secret)[1]["Set-Cookie"].split(";")[0]
+        status, _, page = self.req("/account", cookie=link)
+        self.assertEqual(status, 200)
+        self.assertIn("Carpenter Meier: kitchen &amp; &lt;bath&gt;", page)
+        self.assertEqual(self.req("/avatar/" + quote(name) + ".svg", cookie=link)[0], 200)
 
     def test_access_link_logout_and_log(self):
         boss = self.login("boss", "boss-password")
