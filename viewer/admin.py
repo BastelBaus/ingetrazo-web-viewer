@@ -15,10 +15,13 @@ always stays an active admin.
 """
 from __future__ import annotations
 
+import json
 from html import escape
 from urllib.parse import quote
 
 from mcp_http import shares as share_mod
+
+from . import audit
 from mcp_http.users import ROLES, SETTINGS, UserError
 
 CSS = """
@@ -66,6 +69,12 @@ CSS = """
 .panel td.detail{font-size:12.5px;color:var(--muted);overflow-wrap:anywhere}
 .panel .sub{display:flex;gap:6px;margin:4px 0 0}
 .panel a.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
+.panel .filters{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:8px 0}
+.panel td.when{white-space:nowrap;font-variant-numeric:tabular-nums}
+.panel .st.access{color:var(--muted)}.panel .st.login,.panel .st.logout{border-color:var(--accent)}
+.panel .st.admin{border-color:var(--warn);background:color-mix(in srgb,var(--warn) 14%,var(--card))}
+.panel .st.error,.panel .st.bad{border-color:#c0392b;background:color-mix(in srgb,#c0392b 12%,var(--card))}
+.panel td.req{font-family:ui-monospace,monospace;font-size:12.5px;overflow-wrap:anywhere}
 @media (max-width:820px){.panel table,.panel tbody,.panel tr,.panel td{display:block;width:100%}
 .panel thead{display:none}.panel tr{border-bottom:1px solid var(--line)}.panel td{border:0;padding:4px 10px}}
 """
@@ -270,7 +279,8 @@ def _nav(here: str) -> str:
         f'<a class="btn{" primary" if key == here else ""}" href="{href}"'
         + (' aria-current="page"' if key == here else "") + f'>{label}</a>'
         for key, href, label in (("users", "/admin", "Users"),
-                                 ("renders", "/admin/renders", "Renders"))) + "</nav>"
+                                 ("renders", "/admin/renders", "Renders"),
+                                 ("log", "/admin/log", "Log"))) + "</nav>"
 
 
 #: The render states (viewer/render.py ``Renderer.status``) as shown.
@@ -756,3 +766,117 @@ def act_account(auth, user, form: dict) -> tuple[str, str]:
         raise UserError("unknown action")
     except UserError as exc:
         return "", str(exc)[:1].upper() + str(exc)[1:] + "."
+
+
+#: The log's kinds (viewer/audit.py) as the filter names them.
+LOG_KINDS = {"": "Everything", "access": "Access", "login": "Logins", "logout": "Logouts",
+             "admin": "Admin changes", "error": "Errors"}
+#: One entry's kind, as the table names it.
+LOG_KIND = {"access": "Access", "login": "Login", "logout": "Logout", "admin": "Admin",
+            "error": "Error"}
+LOG_PAGE = 200
+
+
+def _log_filter(query: dict) -> dict:
+    def get(key: str) -> str:
+        return (query.get(key) or [""])[0].strip()
+    kind = get("kind") if get("kind") in LOG_KINDS else ""
+    since = get("since")
+    since = since if len(since) == 10 and since[4] == "-" and since[7] == "-" else ""
+    try:
+        offset = max(0, int(get("offset") or 0))
+    except ValueError:
+        offset = 0
+    return {"kind": kind, "user": get("user")[:64], "text": get("q")[:200],
+            "since": since, "offset": offset}
+
+
+def log_download(query: dict) -> bytes:
+    """``/admin/log.jsonl``: what the filter finds, newest first, as JSON lines."""
+    f = _log_filter(query)
+    rows, _ = audit.read(f["kind"], f["user"], f["text"], f["since"], 0, 100000)
+    return "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in rows).encode("utf-8")
+
+
+def log_page(auth, user, query: dict, title: str = "") -> bytes:
+    """``/admin/log``: the audit log (viewer/audit.py), newest first, with
+    a filter by kind, user, text and first day; 200 entries a page."""
+    from urllib.parse import urlencode
+    f = _log_filter(query)
+    rows, more = audit.read(f["kind"], f["user"], f["text"], f["since"],
+                            f["offset"], LOG_PAGE)
+    page_q = {k: v for k, v in (("kind", f["kind"]), ("user", f["user"]),
+                                ("q", f["text"]), ("since", f["since"])) if v}
+    kinds = "".join(f'<option value="{k}"{" selected" if k == f["kind"] else ""}>{v}</option>'
+                    for k, v in LOG_KINDS.items())
+    names = audit.users()
+    if f["user"] and f["user"] not in names:
+        names.append(f["user"])
+    people = '<option value="">Every user</option>' + "".join(
+        f'<option{" selected" if n == f["user"] else ""}>{escape(n)}</option>' for n in names)
+    form = ('<form class="filters" method="get" action="/admin/log">'
+            f'<select name="kind" aria-label="Kind">{kinds}</select>'
+            f'<select name="user" aria-label="User">{people}</select>'
+            f'<input name="q" value="{escape(f["text"])}" placeholder="Search (path, IP, text)" '
+            'aria-label="Search">'
+            f'<input type="date" name="since" value="{escape(f["since"])}" aria-label="From day" '
+            'title="From this day on (UTC)">'
+            '<button class="primary">Filter</button>'
+            '<a class="btn" href="/admin/log">Reset</a>'
+            f'<a class="btn" href="/admin/log.jsonl?{escape(urlencode(page_q))}" '
+            'title="What the filter finds, as JSON lines">Download</a></form>')
+    out = []
+    for e in rows:
+        kind = str(e.get("kind", ""))
+        status = e.get("status")
+        bad = isinstance(status, int) and status >= 400
+        req = " ".join(str(e[k]) for k in ("method", "path") if e.get(k))
+        if e.get("action"):
+            req = (req + " · " if req else "") + str(e["action"]) + (
+                f' → {e["target"]}' if e.get("target") else "")
+        ip = str(e.get("ip", ""))
+        if e.get("fwd"):
+            ip += f' (fwd {e["fwd"]})'
+        who = str(e.get("user", ""))
+        if who and e.get("source"):
+            who_html = (f'<a href="/admin/log?{escape(urlencode({"user": who}))}">{escape(who)}</a>'
+                        f' <span class="muted">{escape(str(e["source"]))}</span>')
+        elif who:
+            who_html = escape(who)
+        else:
+            who_html = '<span class="muted">–</span>'
+        ms = f' <span class="muted">{e["ms"]} ms</span>' if e.get("ms") is not None else ""
+        code = ("" if status is None else
+                f'<span class="st{" bad" if bad else ""}">{escape(str(status))}</span>')
+        out.append(
+            f'<tr><td class="when muted" data-ts="{escape(str(e.get("ts", "")))}">'
+            f'{escape(str(e.get("ts", ""))[:19].replace("T", " "))} UTC</td>'
+            f'<td><span class="st {escape(kind)}">{escape(LOG_KIND.get(kind, kind))}</span></td>'
+            f'<td>{who_html}</td><td class="muted">{escape(ip)}</td>'
+            f'<td class="req">{escape(req)}</td>'
+            f'<td class="when">{code}{ms}</td>'
+            f'<td class="detail">{escape(str(e.get("detail", "")))}</td></tr>')
+    pager = []
+    if f["offset"]:
+        pager.append(f'<a class="btn" href="/admin/log?{escape(urlencode({**page_q, "offset": max(0, f["offset"] - LOG_PAGE)}))}">‹ Newer</a>')
+    if more:
+        pager.append(f'<a class="btn" href="/admin/log?{escape(urlencode({**page_q, "offset": f["offset"] + LOG_PAGE}))}">Older ›</a>')
+    if not audit.enabled():
+        info = '<p class="err">The audit log is off (<code>VIEWER_AUDIT=false</code>).</p>'
+    else:
+        limit = audit.days()
+        info = ('<p class="muted">Who opened what, logins, changes in this panel and errors. '
+                f'Kept {"for " + str(limit) + " days" if limit else "without a time limit"}, '
+                f'at most {audit.keep() + 1} files of {audit.max_bytes() // 1048576} MB '
+                f'(<code>{escape(str(audit.path()))}</code>). Times in your browser\'s time zone.</p>')
+    table = ('<table><thead><tr><th>Time</th><th>Kind</th><th>User</th><th>Address</th>'
+             '<th>Request / change</th><th>Status</th><th>Detail</th></tr></thead><tbody>'
+             + "".join(out) + "</tbody></table>" if out else '<p class="muted">No entries.</p>')
+    # The UTC times in the browser's time zone.
+    script = ('<script>document.querySelectorAll("td.when[data-ts]").forEach(td=>{'
+              'const d=new Date(td.dataset.ts);if(!isNaN(d))td.textContent=d.toLocaleString('
+              'undefined,{year:"numeric",month:"2-digit",day:"2-digit",hour:"2-digit",'
+              'minute:"2-digit",second:"2-digit"});});</script>')
+    body = (_nav("log") + "<h2>Log</h2>" + info + form + table
+            + (f'<div class="chips">{"".join(pager)}</div>' if pager else "") + script)
+    return _wrap("Log", body, user, title)

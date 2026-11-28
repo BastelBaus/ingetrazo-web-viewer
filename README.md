@@ -268,6 +268,32 @@ container: user sources such as LDAP are configured in the identity provider.
 
 Sessions (`local`, `oidc`) last `VIEWER_SESSION_DAYS` (30) and end when the container restarts.
 
+### Audit log
+
+The viewer writes an audit log: who opened which page and when, logins (also failed ones, password, guest,
+access link, OIDC), logouts, every change in the admin panel and on `/account` with its outcome, and errors
+(failed renders, models that could not be opened, failed requests). Admins read it at **`/admin` → *Log***,
+filtered by kind, user, text and first day, 200 entries a page, and download what the filter finds as JSON
+lines (`/admin/log.jsonl`). Rendered images, `/static`, `/events`, avatars and `/healthz` are not logged
+(every page loads them). An access link's token never goes into the log.
+
+It is one JSON object per line in `VIEWER_AUDIT_FILE` (default `/state/audit.log`, in the `viewer-state`
+volume, so it survives a restart and a new container), rotated at `VIEWER_AUDIT_MAX_MB` with
+`VIEWER_AUDIT_KEEP` old files. The access lines on stderr (`docker logs`) stay as before and now name the user.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `VIEWER_AUDIT` | `true` | `false` turns the audit log off |
+| `VIEWER_AUDIT_FILE` | `/state/audit.log` | Where it is written |
+| `VIEWER_AUDIT_MAX_MB` | `10` | Size at which the file is rotated |
+| `VIEWER_AUDIT_KEEP` | `5` | Rotated files kept (`audit.log.1` …) |
+| `VIEWER_AUDIT_DAYS` | `90` | Older entries are not shown and their files are dropped on rotation; `0` = no limit |
+| `VIEWER_TRUSTED_PROXIES` | `PROXY_TRUSTED_IPS` | Reverse proxies (addresses or networks, comma-separated) whose `X-Forwarded-For` names the client. From any other peer the header is kept only as `fwd` (unverified) |
+
+Behind a reverse proxy, set `VIEWER_TRUSTED_PROXIES` to the proxy's address, otherwise every entry shows the
+proxy as the client. IP addresses and user names are personal data (GDPR): keep `VIEWER_AUDIT_DAYS` as short as
+you need and mention the log in your privacy notice.
+
 ### Users
 
 The users live in one SQLite file, `users.db`, on the volume `users` that both services mount (`USERS_DB`, default

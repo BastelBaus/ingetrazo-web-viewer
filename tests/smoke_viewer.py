@@ -161,7 +161,7 @@ def main():
     def admin_pages():
         # The real process (python -m viewer.server): admin.py imports
         # viewer.server, which must be the copy main() set up.
-        for path in ("/admin", "/account"):
+        for path in ("/admin", "/account", "/admin/log"):
             status, _, body = get(path, BASIC)
             assert status == 200, (path, status, body[:200])
     check("admin and account pages", admin_pages)

@@ -37,7 +37,7 @@ from mcp_http import folders, shares
 from mcp_http.common import log
 from mcp_http.users import UserError
 
-from . import admin, avatar, site, version
+from . import admin, audit, avatar, site, version
 from mcp_http.remote import RemoteApp, engine_urls
 from .auth import Auth, User
 from .render import (BACKGROUND, CACHE_DIR, GLB_MAX_MB, NEXT, NOW, POLL, PRERENDER, PREVIEW,
@@ -791,12 +791,47 @@ class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "ingetrazo-viewer"
 
+    def parse_request(self):
+        # One handler serves every request of a kept-alive connection.
+        self._who: User | None = None
+        self._t0 = time.monotonic()
+        return super().parse_request()
+
     def log_message(self, fmt, *args):
         if not self.path.startswith(("/healthz", "/files/", "/static/")):
-            line = fmt % args
-            if "/t/" in line:                    # an access link's token stays out of the log
-                line = re.sub(r"/t/[^\s?\"]+", "/t/…", line)
-            sys.stderr.write("[viewer] %s %s\n" % (self.address_string(), line))
+            line = audit.redact(fmt % args)      # an access link's token stays out of the log
+            who = getattr(self, "_who", None)
+            sys.stderr.write("[viewer] %s%s %s\n" % (
+                self._client()[0], f" {who.name}" if who else "", line))
+
+    def log_request(self, code="-", size="-"):
+        super().log_request(code, size)
+        path = getattr(self, "path", "")
+        if path.startswith(audit.QUIET):
+            return
+        try:
+            status = int(code)
+        except (TypeError, ValueError):
+            status = None
+        self._audit("access", method=self.command, path=path, status=status,
+                    ms=round((time.monotonic() - getattr(self, "_t0", time.monotonic())) * 1000))
+
+    def _client(self) -> tuple[str, str]:
+        """(the client's address, an unverified X-Forwarded-For)."""
+        headers = getattr(self, "headers", None)
+        return audit.client(self.client_address[0],
+                            headers.get("X-Forwarded-For", "") if headers else "")
+
+    def _audit(self, kind: str, user: User | str | None = None, **fields) -> None:
+        """One audit log entry (viewer/audit.py) about this request."""
+        who = user or getattr(self, "_who", None)
+        ip, fwd = self._client()
+        if isinstance(who, str):
+            fields.setdefault("user", who)
+        elif who is not None:
+            fields.setdefault("user", who.name)
+            fields.setdefault("source", who.source)
+        audit.record(kind, ip=ip, fwd=fwd, **fields)
 
     def _send(self, status: int, body: bytes, ctype: str, extra: dict | None = None):
         self.send_response(status)
@@ -858,6 +893,8 @@ class Handler(BaseHTTPRequestHandler):
     def _authorised(self, path: str) -> User | None:
         user = self._user()
         if user is not None:
+            if auth.mode != "none":
+                self._who = user
             return user
         wants_html = "text/html" in self.headers.get("Accept", "")
         page = wants_html and not path.startswith(("/files/", "/events"))
@@ -937,7 +974,11 @@ class Handler(BaseHTTPRequestHandler):
             nxt = _safe_next((self._form().get("next") or ["/"])[0])
             user = auth.guest_login()
             if user is None:
+                self._audit("login", user="guest", source="guest", status=403,
+                            detail="guests switched off")
                 return self._login_page(403, "Guests may not log in at the moment.", nxt)
+            self._who = user
+            self._audit("login", status=303, detail="guest")
             return self._send(303, b"", "text/plain", {
                 "Location": nxt, "Set-Cookie": self._session_cookie(user)})
         if path == "/account/settings" and auth.mode != "none":
@@ -955,21 +996,38 @@ class Handler(BaseHTTPRequestHandler):
                 if not user.admin:
                     return self._send(403, b"admins only\n", "text/plain")
                 note, error = _render_action(form)
+                self._admin_audit(form, note, error)
                 return self._html(400 if error else 200, admin.renders_page(
                     auth, user, renderer.status(), note, error, site.title()))
             if path == "/admin":
                 if not user.admin:
                     return self._send(403, b"admins only\n", "text/plain")
                 note, error = admin.act(auth, user, form)
+                self._admin_audit(form, note, error)
                 if (form.get("action") or [""])[0] == "shares":
                     return self._html(400 if error else 200, admin.shares_page(
                         auth, user, (form.get("name") or [""])[0], note, error, site.title()))
                 return self._html(400 if error else 200,
                                   admin.page(auth, user, note, error, site.title()))
             note, error = admin.act_account(auth, user, form)
+            self._admin_audit(form, note, error, prefix="account: ")
             return self._html(400 if error else 200,
                               admin.account_page(auth, user, note, error, site.title()))
         return self._send(404, b"not found\n", "text/plain")
+
+    def _admin_audit(self, form: dict, note: str, error: str, prefix: str = "") -> None:
+        """A change in the admin panel (or one's own account), and its outcome."""
+        def get(key: str) -> str:
+            return (form.get(key) or [""])[0]
+        if note.startswith("TOKEN:"):
+            note = "a new token was made"
+        elif note.startswith("LINK:"):
+            note = f"a new access link for {note[5:].partition(':')[0]}"
+        self._audit("admin", method="POST", path=urlsplit(self.path).path,
+                    status=400 if error else 200,
+                    action=prefix + (get("action") or "?"),
+                    target=(get("name") or get("slug")).strip()[:120],
+                    detail=error or note)
 
     def _post_settings(self):
         """A setting the page's script changed: JSON back, all settings."""
@@ -995,10 +1053,16 @@ class Handler(BaseHTTPRequestHandler):
         nxt = _safe_next((form.get("next") or ["/"])[0])
         user = auth.login(name, pw)
         if user is None and auth.users.authenticate(name, pw) is not None:
+            self._audit("login", user=name[:64], source="local", status=403,
+                        detail="password right, but no web viewer for this account")
             return self._login_page(403, "This account may not use the web viewer.", nxt)
         if user is not None:
+            self._who = user
+            self._audit("login", status=303, detail="password")
             return self._send(303, b"", "text/plain", {
                 "Location": nxt, "Set-Cookie": self._session_cookie(user)})
+        self._audit("login", user=name[:64], source="local", status=401,
+                    detail="wrong user name or password")
         time.sleep(0.7)                          # slows down guessing
         return self._login_page(401, "Wrong user name or password.", nxt)
 
@@ -1022,6 +1086,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._link_login(path[3:], nxt)
         if path == "/logout":
             link = self._cookie_user()
+            if link is not None:
+                self._audit("logout", user=link)
             if link is not None and link.source == "link":
                 self._html(200, message_page(
                     "You are logged out. Open your access link again to come back."),
@@ -1059,14 +1125,19 @@ class Handler(BaseHTTPRequestHandler):
                                                  (query.get("state") or [""])[0])
         except (OSError, ValueError) as exc:
             log(f"viewer: OIDC login failed: {exc}")
+            self._audit("login", source="oidc", status=400, detail=f"OIDC login failed: {exc}")
             self._html(502 if isinstance(exc, OSError) else 400, message_page(
                 f"The login did not work: {exc}", "/auth/login", "Try again"))
             return True
         user = auth.logged_in(name, groups)
         if user is None:
+            self._audit("login", user=name[:64], source="oidc", status=403,
+                        detail="account switched off or refused")
             self._html(403, message_page(
                 "Your account is switched off. Ask an admin of this viewer."))
             return True
+        self._who = user
+        self._audit("login", status=303, detail="OIDC")
         self._send(303, b"", "text/plain",
                    {"Location": _safe_next(nxt), "Set-Cookie": self._session_cookie(user)})
         return True
@@ -1079,11 +1150,15 @@ class Handler(BaseHTTPRequestHandler):
             return True
         user = auth.link_login(token)
         if user is None:
+            self._audit("login", source="link", status=403,
+                        detail="access link not valid (wrong, switched off or expired)")
             time.sleep(0.7)                      # slows down guessing
             self._html(403, message_page(
                 "This access link does not work (any more). Ask whoever gave it to you "
                 "for a new one."), {"Referrer-Policy": "no-referrer"})
             return True
+        self._who = user
+        self._audit("login", status=303, detail="access link")
         self._send(303, b"", "text/plain", {
             "Location": nxt, "Set-Cookie": self._session_cookie(user),
             "Referrer-Policy": "no-referrer", "Cache-Control": "no-store"})
@@ -1112,6 +1187,15 @@ class Handler(BaseHTTPRequestHandler):
                 return self._html(403, message_page("Only admins see the renders.", "/", "Back"))
             return self._send(200, admin.renders_page(auth, user, renderer.status(),
                                                       title=site.title()), html, nocache)
+        if path in ("/admin/log", "/admin/log.jsonl") and auth.mode != "none":
+            if not user.admin:
+                return self._html(403, message_page("Only admins see the log.", "/", "Back"))
+            query = parse_qs(parts.query)
+            if path.endswith(".jsonl"):
+                return self._send(200, admin.log_download(query), "application/x-ndjson",
+                                  {"Cache-Control": "no-store", "Content-Disposition":
+                                   'attachment; filename="viewer-audit.jsonl"'})
+            return self._html(200, admin.log_page(auth, user, query, title=site.title()))
         if path == "/admin/shares" and auth.mode != "none":
             if not user.admin:
                 return self._html(403, message_page("Only admins manage the users.", "/", "Back"))
@@ -1232,6 +1316,16 @@ class Handler(BaseHTTPRequestHandler):
                    {"Cache-Control": "no-store"})
 
 
+class Server(ThreadingHTTPServer):
+    def handle_error(self, request, client_address):
+        """An exception in a request: on stderr as before, and in the audit log."""
+        exc = sys.exc_info()[1]
+        if not isinstance(exc, (BrokenPipeError, ConnectionResetError)):
+            audit.record("error", ip=client_address[0] if client_address else "",
+                         detail=f"request failed: {exc!r}")
+        super().handle_error(request, client_address)
+
+
 def main() -> None:
     global renderer, auth
     auth = Auth()                    # a wrong setting stops here, before IngeTrazo
@@ -1244,7 +1338,7 @@ def main() -> None:
     where = "engines " + ", ".join(urls)
     renderer = Renderer(apps)
     port = int(os.environ.get("VIEWER_PORT", 8080))
-    server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    server = Server(("0.0.0.0", port), Handler)
     server.daemon_threads = True
     threading.Thread(target=server.serve_forever, name="http", daemon=True).start()
     log(f"viewer on :{port} (auth: {auth.describe()}); cache {CACHE_DIR}; "

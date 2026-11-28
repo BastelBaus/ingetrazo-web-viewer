@@ -244,7 +244,8 @@ class ViewerLoginTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.env = {"VIEWER_AUTH_MODE": "local", "ADMIN_USER": "boss",
                     "ADMIN_PASSWORD": "boss-password",
-                    "USERS_DB": str(Path(self.tmp.name) / "users.db")}
+                    "USERS_DB": str(Path(self.tmp.name) / "users.db"),
+                    "VIEWER_AUDIT_FILE": str(Path(self.tmp.name) / "audit.log")}
         self.saved_env = {k: os.environ.get(k) for k in self.env}
         os.environ.update(self.env)
         self.saved_state = auth_mod.STATE_DIR
@@ -559,6 +560,47 @@ class ViewerLoginTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn("Open your access link again", page)
         self.assertIn("Max-Age=0", headers["Set-Cookie"])
+
+    def test_audit_log(self):
+        self.req("/login", {"user": "boss", "password": "wrong"})
+        boss = self.login("boss", "boss-password")
+        token = self.csrf(self.req("/admin", cookie=boss)[2])
+        self.req("/admin", {"action": "create", "name": "anna", "password": "anna-pass",
+                            "role": "user", "csrf": token}, boss)
+        page = self.req("/admin", {"action": "link_create", "name": "meier",
+                                   "csrf": token}, boss)[2]
+        secret = re.search(r"/t/(itv_[\w-]+)", page).group(1)
+        self.req("/t/" + secret)
+        self.req("/t/itv_wrong")
+        anna = self.login("anna", "anna-pass")
+        self.req("/account", cookie=anna)
+        self.assertEqual(self.req("/admin/log", cookie=anna)[0], 403)   # admins only
+        log = (Path(self.tmp.name) / "audit.log").read_text()
+        self.assertNotIn(secret, log)
+        entries = [json.loads(line) for line in log.splitlines()]
+
+        def find(**want):
+            return [e for e in entries if all(e.get(k) == v for k, v in want.items())]
+        self.assertTrue(find(kind="login", user="boss", status=401))
+        self.assertTrue(find(kind="login", user="boss", status=303, source="local"))
+        self.assertTrue(find(kind="admin", user="boss", action="create", target="anna",
+                             detail="Added anna."))
+        self.assertTrue(find(kind="admin", action="link_create",
+                             detail="a new access link for meier"))
+        self.assertTrue(find(kind="login", user="meier", source="link", status=303))
+        self.assertTrue(find(kind="login", source="link", status=403))
+        self.assertTrue(find(kind="access", user="anna", path="/account", status=200))
+        self.assertTrue(find(kind="access", user="anna", path="/admin/log", status=403))
+        # The admin page: filtered by user and kind, and the download.
+        status, _, page = self.req("/admin/log?user=anna&kind=access", cookie=boss)
+        self.assertEqual(status, 200)
+        self.assertIn("/account", page)
+        self.assertNotIn("Added anna.", page)
+        status, headers, text = self.req("/admin/log.jsonl?kind=admin", cookie=boss)
+        self.assertEqual(status, 200)
+        self.assertIn("attachment", headers["Content-Disposition"])
+        kinds = {json.loads(line)["kind"] for line in text.splitlines()}
+        self.assertEqual(kinds, {"admin"})
 
     def test_admin_cannot_lock_themself_out(self):
         boss = self.login("boss", "boss-password")
