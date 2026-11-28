@@ -79,9 +79,15 @@ The checks:
   Merge commits are not checked. Takes seconds.
 - **smoke**: shellcheck, unit tests, the image built for amd64, and a short end-to-end run of the MCP
   service and the viewer (`tests/smoke.sh`). Takes a few minutes, so it runs on every PR.
-- **full test** (planned): the long run before a release. It runs only on PRs into `main`, i.e. release
-  and hotfix PRs. Its scope is still open. Candidates: the image for amd64 and arm64, the smoke test on both, the
-  auth, OAuth and folder smoke tests, and rendering a sample model with all its sheets and views.
+- **full test** (`.github/workflows/full.yml`): the long run before a release. It runs on PRs into `main`
+  (release and hotfix PRs), on a PR labelled `full-test`, and by hand. On amd64 and arm64 (native runners):
+  the unit tests including the slow ones (`FULL_TEST=1`), the image, the smoke test and `tests/full.sh`:
+  `compose.yaml` as shipped with `VIEWER_PRERENDER=all`, every sheet, view, the PDF and the 3D model of an
+  example rendered and served, MCP through the gateway, the stack's isolation (engines without ports and
+  without a way out, a secret of their own each, no root, `/data` read-only for the services) and security
+  checks against the running servers. Then a scan of the image for known vulnerabilities (report only). The
+  engine is `ENGINE_IMAGE` (or `:dev`); on arm64 the newest engine image built for it. The check to require
+  is `full test`.
 
 ### Status today
 
@@ -92,8 +98,8 @@ Not everything above is configured yet:
 - Ruleset *main: smoke*: *smoke* required on `main`. No bypass.
 - Ruleset *main: review (admins may bypass)*: 1 code-owner approval on `main`; repository admins may
   bypass it when they merge a PR.
-- Open: *smoke* as a required check on `dev`; rules for `release/*` and tags `v*`; the *full test*
-  workflow and making it required on `main`; `dev` as the default branch (it is still `main`).
+- Open: *smoke* as a required check on `dev`; rules for `release/*` and tags `v*`; making *full test*
+  required on `main`; `dev` as the default branch (it is still `main`).
 - Auto-merge is switched on for the repository. GitHub cannot switch it off for one branch, so on `main`
   the required review keeps the merge in a maintainer's hands; nobody arms auto-merge on PRs into `main`.
 
