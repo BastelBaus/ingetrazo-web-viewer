@@ -89,19 +89,21 @@ def _wrap(title: str, body: str, user, site: str) -> bytes:
 
 
 def _messages(note: str, error: str) -> str:
-    if note.startswith("TOKEN:"):              # a new token: shown once, easy to copy
-        return ('<div class="note">Your new token – copy it now, it is shown only once:'
-                f'<div class="token">{escape(note[6:])}</div></div>')
-    if note.startswith("LINK:"):               # a new access link: shown once
+    if note.startswith("TOKEN:"):              # a token, new or shown again
+        kind, _, token = note[6:].partition(":")
+        head = "Your new token:" if kind == "new" else "Your token:"
+        return (f'<div class="note">{head}<div class="token">{escape(token)}</div>'
+                '<p class="muted">You can show it here again later.</p></div>')
+    if note.startswith("LINK:"):               # an access link, new or shown again
         name, _, token = note[5:].rpartition(":")   # a name may hold ":"
         path = "/t/" + token
         return ('<div class="note">The access link for <strong>' + escape(name)
-                + '</strong> – copy it now, it is shown only once:'
+                + '</strong>:'
                 f'<div class="token" id="newlink">{escape(path)}</div>'
                 '<script>(function(){const e=document.getElementById("newlink");'
                 'e.textContent=location.origin+e.textContent;})()</script>'
                 '<p class="muted">Whoever has it sees what its folders allow, until you switch '
-                'it off, replace or remove it. Scripts send the part after <code>/t/</code> as '
+                'it off, replace or remove it; <em>Show link</em> shows it again. Scripts send the part after <code>/t/</code> as '
                 '<code>Authorization: Bearer …</code>. '
                 f'<a href="/admin/shares?name={quote(name)}">Choose its folders</a></p></div>')
     return ((f'<div class="note">{escape(note)}</div>' if note else "")
@@ -245,6 +247,12 @@ def _links(auth, user, links: list) -> str:
             _form(auth, user, "active", acc.name,
                   f'<input type="hidden" name="on" value="{0 if acc.active else 1}">'
                   f'<button>{"Switch off" if acc.active else "Switch on"}</button>'),
+            (_form(auth, user, "link_show", acc.name,
+                   '<button title="Show the current link again">Show link</button>')
+             if info.get("shown") else
+             '<span class="muted" title="Made before links were kept, or the key changed; '
+             'it can be shown once it was used again, or make a new link">not shown</span>'
+             if info else ""),
             _form(auth, user, "link_new", acc.name,
                   '<button title="A new link; the old one and its sessions stop working">'
                   'New link</button>',
@@ -432,6 +440,11 @@ def act(auth, user, form: dict) -> tuple[str, str]:
             return f"LINK:{acc.name}:{token}", ""
         if action == "link_new":
             return f"LINK:{name}:{users.new_link(name)}", ""
+        if action == "link_show":
+            token = users.show_link(name)
+            if token is None:
+                raise UserError("this link cannot be shown; make a new link")
+            return f"LINK:{name}:{token}", ""
         if action == "link_expires":
             day = users.set_expires(name, get("expires"))
             return (f"The link {name} works through {day}." if day
@@ -716,7 +729,15 @@ def _tokens(auth, user, acc) -> str:
         f'<tr><td>{escape(t["label"] or "–")}</td>'
         f'<td class="muted">{escape(t["created"][:10])}</td>'
         f'<td class="muted">{escape((t["last_used"] or "never")[:16].replace("T", " "))}</td>'
-        '<td class="acts"><div><form class="inline" method="post" action="/account">'
+        '<td class="acts"><div>'
+        + ('<form class="inline" method="post" action="/account">'
+           f'<input type="hidden" name="csrf" value="{csrf}">'
+           '<input type="hidden" name="action" value="show">'
+           f'<input type="hidden" name="id" value="{t["id"]}">'
+           '<button>Show</button></form>' if t["shown"] else
+           '<span class="muted" title="Made before tokens were kept, or the key changed; '
+           'it can be shown once it was used again">not shown</span>')
+        + '<form class="inline" method="post" action="/account">'
         f'<input type="hidden" name="csrf" value="{csrf}">'
         '<input type="hidden" name="action" value="revoke">'
         f'<input type="hidden" name="id" value="{t["id"]}">'
@@ -753,7 +774,12 @@ def act_account(auth, user, form: dict) -> tuple[str, str]:
             return "Back to the default avatar.", ""
         if get("action") == "token":
             token = auth.users.create_token(user.name, get("label"))
-            return "TOKEN:" + token, ""
+            return "TOKEN:new:" + token, ""
+        if get("action") == "show":
+            token = auth.users.show_token(user.name, get("id"))
+            if token is None:
+                raise UserError("this token cannot be shown; make a new one")
+            return "TOKEN:again:" + token, ""
         if get("action") == "revoke":
             if not auth.users.revoke_token(user.name, get("id")):
                 raise UserError("no such token")

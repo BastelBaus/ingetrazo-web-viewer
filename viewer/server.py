@@ -1037,10 +1037,13 @@ class Handler(BaseHTTPRequestHandler):
         """A change in the admin panel (or one's own account), and its outcome."""
         def get(key: str) -> str:
             return (form.get(key) or [""])[0]
-        if note.startswith("TOKEN:"):
-            note = "a new token was made"
+        if note.startswith("TOKEN:"):          # never the token itself
+            note = ("a new token was made" if note.startswith("TOKEN:new:")
+                    else "a token was shown again")
         elif note.startswith("LINK:"):
-            note = f"a new access link for {note[5:].partition(':')[0]}"
+            name = note[5:].rpartition(":")[0]
+            note = (f"the access link for {name} was shown again"
+                    if get("action") == "link_show" else f"a new access link for {name}")
         self._audit("admin", method="POST", path=urlsplit(self.path).path,
                     status=400 if error else 200,
                     action=prefix + (get("action") or "?"),
