@@ -279,6 +279,9 @@ The users live in one SQLite file, `users.db`, on the volume `users` that both s
 - **Renders** (`/admin/renders`, admins): every saved view, sheet, 3D model and PDF of every model and its render
   status (rendered, rendering now, queued, failed with the error, not rendered, outdated); *Render missing* queues
   what is not rendered yet, of one model or all.
+- **The owner** (`local` mode) is the admin named in `ADMIN_USER`: nobody can make them a user, switch them off or
+  remove them, and every start puts them back as an active admin. Other admins can be made users by another
+  admin, but no admin can take away their own admin role, so nobody locks themself out.
 - **The first admin** comes from `ADMIN_USER` (default `admin`) / `ADMIN_PASSWORD` while there is no active admin. After that the
   list decides: changing `ADMIN_PASSWORD` later does nothing; change the password at `/account` or `/admin`.
   `VIEWER_USER` / `VIEWER_PASSWORD`, the old names, still work. An existing first admin keeps its name (before:
