@@ -56,6 +56,8 @@ from mcp_http import folders
 from mcp_http.common import DATA_DIR, log
 from mcp_http.remote import RemoteApp
 
+from . import audit
+
 CACHE_DIR = Path(os.environ.get("INGETRAZO_CACHE", "/cache"))
 POLL = float(os.environ.get("VIEWER_POLL_SECONDS", 3))
 SETTLE = float(os.environ.get("VIEWER_SETTLE_SECONDS", 2))
@@ -502,6 +504,7 @@ class Renderer:
                 self._scan()
             except Exception as exc:                 # keep watching
                 log(f"viewer: scan failed: {exc!r}")
+                audit.record("error", detail=f"scan failed: {exc!r}")
             time.sleep(POLL)
 
     def _scan(self) -> None:
@@ -543,6 +546,7 @@ class Renderer:
                 self._task(slug, item, priority)
             except Exception as exc:                 # keep working
                 log(f"viewer: {slug} {item}: {exc!r}")
+                audit.record("error", detail=f"{slug} {item}: {exc!r}")
             finally:
                 w.rendering = None
             if self.queue.empty() and self.rendering is None:
@@ -643,6 +647,7 @@ class Renderer:
         except Exception as exc:
             idx["errors"].append(str(exc))
             log(f"viewer: {m.name}: {exc}")
+            audit.record("error", detail=f"{m.name}: could not be opened: {exc}")
         idx["list_seconds"] = round(time.monotonic() - t0, 1)
         # The last rev's pictures stay until the next listing: a page shows
         # them while the new ones render.
@@ -800,6 +805,8 @@ class Renderer:
         log(f"viewer: {m.name}: {item} in {state['seconds']}s"
             + (f" (worker {self._w.n})" if len(self.workers) > 1 else "")
             + (f": {state['error']}" if state.get("error") else ""))
+        if state.get("error"):
+            audit.record("error", detail=f"{m.name}: {item}: {state['error']}")
         self._notify("done", slug=m.slug, rev=idx["rev"], item=item,
                      ok=not state.get("error"))
 
