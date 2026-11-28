@@ -510,8 +510,10 @@ class GatewayDesyncTest(unittest.TestCase):
     def test_unread_bodies_close_the_connection(self):
         from mcp_http import auth as mcp_auth
         from mcp_http import server
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
         with mock.patch.dict(os.environ, {"MCP_AUTH": "token", "MCP_TOKEN": "t" * 20,
-                                          "USERS_DB": ":memory:"}), \
+                                          "USERS_DB": str(Path(tmp.name) / "users.db")}), \
                 mock.patch.object(mcp_auth, "log"), \
                 mock.patch("sys.stderr", io.StringIO()):
             saved = getattr(server, "auth", None), getattr(server, "app", None)
@@ -576,6 +578,83 @@ class StorageTest(Viewer):
         boss = self.login("boss", "boss-password")
         self.req("/logout", cookie=boss)
         self.assertNotEqual(self.req("/admin", cookie=boss)[0], 200)
+
+
+class ShowAgainTest(Viewer):
+    """Tokens and access links shown again (mcp_http/vault.py): only to
+    their owner or an admin, only by a form with its CSRF token, never into
+    a log, and the stored copy useless without the key."""
+
+    def setUp(self):
+        super().setUp()
+        users = self.server.auth.users
+        users.set_rights("boss", mcp=True)
+        users.set_rights("anna", mcp=True)
+        self.boss_token = users.create_token("boss", "laptop")
+        self.boss_id = users.tokens("boss")[0]["id"]
+        _, self.link = users.create_link("Visitor")
+
+    def test_only_the_owner_sees_a_token(self):
+        anna = self.login("anna", "anna-pass")
+        token = self.csrf(anna)
+        status, _, page = self.req("/account", {"action": "show", "id": self.boss_id,
+                                                "csrf": token}, cookie=anna)
+        self.assertEqual(status, 400)
+        self.assertNotIn(self.boss_token, page)
+        boss = self.login("boss", "boss-password")
+        status, headers, page = self.req("/account", {"action": "show", "id": self.boss_id,
+                                                      "csrf": self.csrf(boss)}, cookie=boss)
+        self.assertEqual(status, 200)
+        self.assertIn(self.boss_token, page)
+        self.assertEqual(headers["Cache-Control"], "no-store")
+
+    def test_links_only_for_admins_and_with_csrf(self):
+        anna = self.login("anna", "anna-pass")
+        status, _, page = self.req("/admin", {"action": "link_show", "name": "Visitor",
+                                              "csrf": self.csrf(anna)}, cookie=anna)
+        self.assertEqual(status, 403)
+        self.assertNotIn(self.link, page)
+        boss = self.login("boss", "boss-password")
+        for data in ({"action": "link_show", "name": "Visitor"},
+                     {"action": "show", "id": self.boss_id}):
+            path = "/admin" if data["action"] == "link_show" else "/account"
+            status, _, page = self.req(path, data, cookie=boss)          # no CSRF token
+            self.assertEqual(status, 403, data)
+            self.assertNotIn(self.link, page)
+            self.assertNotIn(self.boss_token, page)
+        status, _, page = self.req("/admin", {"action": "link_show", "name": "Visitor",
+                                              "csrf": self.csrf(boss, "/admin")}, cookie=boss)
+        self.assertIn(self.link, page)
+        logs = self.audit_file.read_text() + sys.stderr.getvalue()
+        self.assertNotIn(self.link, logs)
+        self.assertNotIn(self.boss_token, logs)
+
+    def test_the_stored_copy_is_bound_and_sealed(self):
+        import hashlib
+        from mcp_http import vault
+        v = vault.Vault(b"k" * 32)
+        a = hashlib.sha256(b"itz_secret").hexdigest()            # bound to its row's hash
+        sealed = v.seal("itz_secret", a)
+        self.assertEqual(v.open(sealed, a), "itz_secret")
+        other = hashlib.sha256(b"itz_other").hexdigest()
+        self.assertIsNone(v.open(sealed, other))                     # moved to another row
+        self.assertIsNone(v.open(v.seal("itz_secret", other), other))  # not that row's token
+        self.assertIsNone(vault.Vault(b"x" * 32).open(sealed, a))   # another key
+        raw = bytearray(__import__("base64").urlsafe_b64decode(sealed.split("$", 1)[1]))
+        raw[20] ^= 1                                                 # one bit of the cipher text
+        forged = "v1$" + __import__("base64").urlsafe_b64encode(bytes(raw)).decode()
+        self.assertIsNone(v.open(forged, a))
+        for junk in (None, "", "v1$", "v2$" + sealed[3:], "v1$!!!", sealed[:20]):
+            self.assertIsNone(v.open(junk, a), junk)
+        self.assertNotEqual(v.seal("itz_secret", a), sealed)         # a fresh nonce
+
+    def test_key_file_is_private_and_not_in_the_database(self):
+        db = Path(os.environ["USERS_DB"])
+        key = db.parent / "token.key"
+        self.assertEqual(key.stat().st_mode & 0o077, 0)
+        self.assertNotIn(key.read_text().strip().encode(), db.read_bytes())
+        self.assertNotIn(self.boss_token.encode(), db.read_bytes())
+        self.assertNotIn(self.link.encode(), db.read_bytes())
 
 
 @unittest.skipUnless(FULL, "slow: only in the full test (FULL_TEST=1)")
