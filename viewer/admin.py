@@ -82,7 +82,7 @@ def _messages(note: str, error: str) -> str:
         return ('<div class="note">Your new token – copy it now, it is shown only once:'
                 f'<div class="token">{escape(note[6:])}</div></div>')
     if note.startswith("LINK:"):               # a new access link: shown once
-        name, _, token = note[5:].partition(":")
+        name, _, token = note[5:].rpartition(":")   # a name may hold ":"
         path = "/t/" + token
         return ('<div class="note">The access link for <strong>' + escape(name)
                 + '</strong> – copy it now, it is shown only once:'
