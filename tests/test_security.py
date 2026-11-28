@@ -533,6 +533,51 @@ class GatewayDesyncTest(unittest.TestCase):
                 server.auth, server.app = saved
 
 
+class StorageTest(Viewer):
+    """What is stored, and how."""
+
+    def test_names_never_become_sql(self):
+        users = self.server.auth.users
+        name = "Robert'); DROP TABLE users;--"
+        acc, token = users.create_link(name)
+        self.assertEqual(users.get(name).name, name)
+        users.set_shares(name, [{"path": "p/%_'\"", "access": "r"}])
+        self.assertEqual(users.get(name).shares, [{"path": "p/%_'\"", "access": "r"}])
+        self.assertIsNotNone(users.get("boss"))                 # the table is still there
+        self.assertFalse(users.revoke_token("boss", "%"))       # no LIKE wildcards
+        self.assertFalse(users.revoke_token("boss", "' OR 1=1 --"))
+        self.assertIsNone(users.authenticate("boss' --", "x"))
+        self.assertIsNone(users.authenticate("%", "boss-password"))
+
+    def test_audit_lines_cannot_be_forged(self):
+        """Line breaks in what a client sends stay inside one JSON entry."""
+        self.req("/x%0a%7B%22kind%22%3A%22admin%22%7D")
+        self.req("/login", {"user": 'eve\n{"kind": "admin", "user": "boss"}', "password": "x"})
+        lines = self.audit_file.read_text().splitlines()
+        entries = [json.loads(line) for line in lines]           # every line is JSON
+        self.assertFalse([e for e in entries if e.get("kind") == "admin"])
+
+    @unittest.expectedFailure
+    def test_private_files_are_not_world_readable(self):
+        """Open: users.db (password and token hashes) and audit.log (IP
+        addresses) are made with the process umask (0644); oauth.json and
+        the engine's secret are 0600."""
+        self.req("/login", {"user": "boss", "password": "wrong"})
+        for f in (Path(os.environ["USERS_DB"]), self.audit_file):
+            self.assertEqual(f.stat().st_mode & 0o077, 0, f.name)
+
+    @unittest.expectedFailure
+    def test_logout_ends_the_session_everywhere(self):
+        """Open: sessions are signed cookies without a server-side list, so
+        logging out only drops the cookie in this browser; a copy of it
+        stays valid until it expires (VIEWER_SESSION_DAYS) or the viewer
+        restarts. Switching the user off or changing their role does end
+        it at once."""
+        boss = self.login("boss", "boss-password")
+        self.req("/logout", cookie=boss)
+        self.assertNotEqual(self.req("/admin", cookie=boss)[0], 200)
+
+
 @unittest.skipUnless(FULL, "slow: only in the full test (FULL_TEST=1)")
 class BruteForceTest(Viewer):
     def test_wrong_passwords_and_links_are_slow(self):
@@ -542,6 +587,18 @@ class BruteForceTest(Viewer):
             status = self.req(path, data)[0]
             self.assertGreaterEqual(time.monotonic() - t0, 0.6, path)
             self.assertIn(status, (401, 403))
+
+    @unittest.expectedFailure
+    def test_parallel_guessing_is_throttled(self):
+        """Open: each wrong password costs its request 0.7 s, but nothing
+        counts them, so parallel requests guess as fast as the server
+        answers (the OAuth consent page stops after 20 in 15 minutes)."""
+        import concurrent.futures
+        t0 = time.monotonic()
+        with concurrent.futures.ThreadPoolExecutor(20) as pool:
+            list(pool.map(lambda i: self.req("/login", {"user": "boss",
+                                                        "password": f"guess-{i}"}), range(40)))
+        self.assertGreater(time.monotonic() - t0, 15)
 
     def test_unknown_user_takes_as_long_as_a_wrong_password(self):
         users = self.server.auth.users
