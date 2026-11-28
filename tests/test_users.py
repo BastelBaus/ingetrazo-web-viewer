@@ -181,6 +181,28 @@ class UsersTest(unittest.TestCase):
         self.assertEqual(len(self.users.tokens("boss")), 1)
         self.assertIsNone(self.users.by_link(mcp))
 
+    def test_owner(self):
+        self.users.ensure_admin("boss", "secret-pass")
+        self.users.create("anna", "anna-pass", "admin")
+        self.assertTrue(self.users.protect_owner("BOSS"))
+        self.assertEqual(self.users.owner, "boss")
+        for change in (lambda: self.users.set_role("boss", "user"),
+                       lambda: self.users.set_active("boss", False),
+                       lambda: self.users.delete("boss"),
+                       lambda: self.users.set_rights("boss", web=False)):
+            with self.assertRaises(UserError):
+                change()
+        self.users.set_role("anna", "user")                       # other admins: yes
+        # Demoted behind its back (an older viewer): restored on start.
+        with self.users._lock:
+            self.users._db.execute("UPDATE users SET role = 'user', active = 0 WHERE name = 'boss'")
+        self.assertTrue(self.users.protect_owner("boss"))
+        acc = self.users.get("boss")
+        self.assertEqual((acc.role, acc.active, acc.web), ("admin", True, True))
+        # Unknown or not local: no owner.
+        self.assertFalse(self.users.protect_owner("nobody"))
+        self.assertIsNone(self.users.owner)
+
     def test_guest(self):
         self.users.ensure_admin("boss", "secret-pass")
         with self.assertRaises(UserError):
@@ -407,7 +429,12 @@ class ViewerLoginTest(unittest.TestCase):
         status, _, page = self.req("/admin", {"action": "role", "name": "boss",
                                               "role": "user", "csrf": token}, boss)
         self.assertEqual(status, 400)
-        self.assertIn("no active admin", page)
+        self.assertIn("own admin role", page)                     # refused before that
+        # The list itself still keeps one active admin.
+        users = self.server.auth.users
+        users.owner = None
+        with self.assertRaisesRegex(UserError, "no active admin"):
+            users.set_role("boss", "user")
 
     def test_change_own_password(self):
         boss = self.login("boss", "boss-password")
@@ -532,6 +559,29 @@ class ViewerLoginTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn("Open your access link again", page)
         self.assertIn("Max-Age=0", headers["Set-Cookie"])
+
+    def test_admin_cannot_lock_themself_out(self):
+        boss = self.login("boss", "boss-password")
+        token = self.csrf(self.req("/admin", cookie=boss)[2])
+        self.req("/admin", {"action": "create", "name": "anna", "password": "anna-pass",
+                            "role": "admin", "csrf": token}, boss)
+        page = self.req("/admin", cookie=boss)[2]
+        self.assertIn("(owner)", page)
+        anna = self.login("anna", "anna-pass")
+        atoken = self.csrf(self.req("/admin", cookie=anna)[2])
+        # anna cannot demote herself, nor the owner.
+        page = self.req("/admin", {"action": "role", "name": "anna", "role": "user",
+                                   "csrf": atoken}, anna)[2]
+        self.assertIn("own admin role", page)
+        for data in ({"action": "role", "role": "user"}, {"action": "active", "on": "0"},
+                     {"action": "delete"}):
+            status, _, page = self.req("/admin", {**data, "name": "boss", "csrf": atoken}, anna)
+            self.assertEqual(status, 400, data)
+            self.assertIn("owner", page)
+        self.assertEqual(self.req("/admin", cookie=anna)[0], 200)   # still admin
+        # The owner can demote anna.
+        self.req("/admin", {"action": "role", "name": "anna", "role": "user", "csrf": token}, boss)
+        self.assertEqual(self.req("/admin", cookie=anna)[0], 403)
 
     def test_guest_login(self):
         from viewer import auth as auth_mod
