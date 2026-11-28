@@ -146,6 +146,13 @@ class RemoteApp:
             self._alive, self._alive_at = status == 200, now
         return self._alive
 
+    def build(self) -> str | None:
+        """The IngeTrazo build the engine runs, as its ``/healthz`` names it
+        (``build``); None when it does not say."""
+        _status, body = self._health(timeout=10.0)
+        found = body.get("build")
+        return str(found) if found else None
+
     def probe(self, max_busy: float = 0.0) -> tuple[int, dict]:
         """``/healthz`` of the service: the engine's own."""
         status, body = self._health(timeout=15.0)

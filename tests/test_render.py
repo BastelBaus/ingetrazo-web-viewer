@@ -472,3 +472,38 @@ class PagesTest(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StaleRenderTest(Base):
+    """Renders made by another IngeTrazo or with other settings are redone."""
+
+    def test_other_settings_count_as_not_rendered(self):
+        self.r.request(self.slug, "sheet:1", render.NOW)
+        self.drain()
+        idx = self.r.index(self.slug)
+        self.assertEqual(self.r.state(idx, "sheet:1")["file"], render.item_file("sheet:1"))
+        saved = render.SHEET_DPI
+        try:
+            render.SHEET_DPI = saved + 1
+            self.assertEqual(self.r.state(idx, "sheet:1"), {})
+            self.assertTrue(self.r.due(idx, "sheet:1"))
+        finally:
+            render.SHEET_DPI = saved
+
+    def test_another_engine_build_lists_again(self):
+        self.r._scan()
+        self.drain()
+        self.assertTrue(self.r.fresh(self.slug))
+        self.r.engine_build = "IngeTrazo abc123"
+        self.assertFalse(self.r.fresh(self.slug))
+        self.r.request(self.slug, "preview", render.NOW)
+        self.drain()
+        idx = self.r.index(self.slug)
+        self.assertEqual(idx["engine"], "IngeTrazo abc123")
+        self.assertTrue(self.r.fresh(self.slug))
+
+    def test_engine_build_from_the_app(self):
+        self.app.build = lambda: "IngeTrazo def456"
+        self.assertEqual(self.r._engine_build(), "IngeTrazo def456")
+        self.app.build = lambda: (_ for _ in ()).throw(OSError("down"))
+        self.assertIsNone(self.r._engine_build())

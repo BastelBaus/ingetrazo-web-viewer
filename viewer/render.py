@@ -25,9 +25,11 @@ their folders, and the views' cameras: cheap) goes to
 URLs change when the model does and a browser may cache them for good.
 
 When a model file changes (modification time or size, and it has stayed
-put for ``VIEWER_SETTLE_SECONDS``), its renders are not redone: the next
+put for ``VIEWER_SETTLE_SECONDS``), or the engine runs another IngeTrazo
+build (its ``/healthz`` says which), its renders are not redone: the next
 listing starts a new rev, and the items are rendered again when someone
-looks at them. The previous rev is kept until the one after, so a page
+looks at them. A render made with other settings (``VIEWER_SHEET_DPI``,
+the view size, …) counts as not rendered. The previous rev is kept until the one after, so a page
 shows the old picture while the new one renders.
 
 ``VIEWER_PRERENDER``: ``previews`` (default) lists every model and renders
@@ -258,6 +260,7 @@ class Renderer:
         self.queue = RenderQueue()
         self.changed = threading.Condition()
         self.generation = 0          # bumped on every event
+        self.engine_build: str | None = None   # IngeTrazo the engine runs
         self.events: collections.deque = collections.deque(maxlen=256)
         self.heartbeat = time.monotonic()
         self._models: dict[str, Model] = {}
@@ -426,12 +429,31 @@ class Renderer:
             return True                     # gone: nothing to list
         if idx.get("source_signature") != sig:
             return False
+        if idx.get("engine") != self.engine_build:   # another IngeTrazo
+            return False
         return not (idx.get("errors") and time.time() - idx.get("listed_ts", 0) > RETRY)
 
     def state(self, idx: dict, item: str) -> dict:
         """An item's render: ``file`` (rendered), ``error``, ``note``,
-        ``warnings``; empty when it was not rendered yet."""
-        return (idx.get("items") or {}).get(item) or {}
+        ``warnings``; empty when it was not rendered yet, or with other
+        render settings than the current ones (its file name says which)."""
+        st = (idx.get("items") or {}).get(item) or {}
+        try:
+            current = item_file(item)
+        except (KeyError, ValueError):
+            current = None
+        if st.get("file") and current and st["file"] != current:
+            return {}
+        return st
+
+    def _engine_build(self) -> str | None:
+        """The IngeTrazo build the engine runs (from its ``/healthz``), or
+        None when it does not say (an older engine)."""
+        get = getattr(self.app, "build", None)
+        try:
+            return get() if callable(get) else None
+        except Exception:                           # noqa: BLE001 — optional
+            return None
 
     def due(self, idx: dict, item: str) -> bool:
         """Not rendered, and not failed a moment ago."""
@@ -468,6 +490,9 @@ class Renderer:
     def run(self) -> None:
         """Starts the render worker, then watches the model folders."""
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        self.engine_build = self._engine_build()
+        if self.engine_build:
+            log(f"viewer: engine runs {self.engine_build}")
         for w in self.workers:
             threading.Thread(target=self._work, args=(w,), daemon=True,
                              name="render" if len(self.workers) == 1 else f"render-{w.n}").start()
@@ -599,6 +624,7 @@ class Renderer:
         rev = f"r{time.time_ns() // 1_000_000}"
         idx = {"format": INDEX_FORMAT, "name": m.name, "folder": m.folder.name,
                "slug": m.slug, "rev": rev, "source_signature": sig,
+               "engine": self.engine_build,
                "listed_at": _now(), "listed_ts": time.time(),
                "sheets": [], "views": [], "cameras": [], "items": {}, "errors": []}
         try:
