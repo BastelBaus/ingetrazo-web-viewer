@@ -64,6 +64,8 @@ services:
       ENGINE_TOKEN: ${MCP_ENGINE_TOKEN:-}
       ENGINE_TOKEN_FILE: /engine/token
       USERS_DB: /users/users.db
+      # The key to show tokens again; unset: /users/token.key (made on the first start).
+      TOKEN_KEY: ${TOKEN_KEY:-}
       DEFAULT_SHARES: ${DEFAULT_SHARES:-*:r}
     volumes:
       # Read-only here: the gateway only checks paths; mcp-engine writes.
@@ -145,6 +147,8 @@ services:
       ENGINE_TOKEN: ${VIEWER_ENGINE_TOKEN:-${ENGINE_TOKEN:-}}
       ENGINE_TOKEN_FILE: /engine/token
       USERS_DB: /users/users.db
+      # The key to show tokens again; unset: /users/token.key (made on the first start).
+      TOKEN_KEY: ${TOKEN_KEY:-}
       DEFAULT_SHARES: ${DEFAULT_SHARES:-*:r}
     volumes:
       - ${INGETRAZO_DATA_DIR:-./data}:/data:ro

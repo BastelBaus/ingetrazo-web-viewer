@@ -181,6 +181,63 @@ class UsersTest(unittest.TestCase):
         self.assertEqual(len(self.users.tokens("boss")), 1)
         self.assertIsNone(self.users.by_link(mcp))
 
+    def test_show_tokens_again(self):
+        self.users.ensure_admin("boss", "secret-pass")
+        mcp = self.users.create_token("boss", "desktop")
+        (info,) = self.users.tokens("boss")
+        self.assertTrue(info["shown"])
+        self.assertEqual(self.users.show_token("boss", info["id"]), mcp)
+        self.assertEqual(self.users.show_token("boss", info["id"]), mcp)    # any time
+        self.assertIsNone(self.users.show_token("other", info["id"]))       # own only
+        self.assertIsNone(self.users.show_token("boss", "nothex"))
+        _, link = self.users.create_link("meier")
+        self.assertEqual(self.users.show_link("meier"), link)
+        self.assertEqual(self.users.show_link("meier"), link)
+        newer = self.users.new_link("meier")
+        self.assertEqual(self.users.show_link("meier"), newer)
+        self.assertRaises(UserError, self.users.show_link, "boss")
+        # The database alone holds no token.
+        raw = (Path(self.tmp.name) / "users.db").read_bytes()
+        self.assertNotIn(mcp.encode(), raw)
+        self.assertNotIn(newer.encode(), raw)
+        self.assertTrue((Path(self.tmp.name) / "token.key").exists())
+
+    def test_show_tokens_other_key(self):
+        """Another key: the tokens still work, but cannot be shown until
+        their next use; a copy moved to another row does not open."""
+        self.users.ensure_admin("boss", "secret-pass")
+        mcp = self.users.create_token("boss", "desktop")
+        other = self.users.create_token("boss", "laptop")
+        _, link = self.users.create_link("meier")
+        (Path(self.tmp.name) / "token.key").write_text("x" * 40)
+        users = Users(Path(self.tmp.name) / "users.db")
+        ids = {t["label"]: t["id"] for t in users.tokens("boss")}
+        self.assertEqual([t["shown"] for t in users.tokens("boss")], [False, False])
+        self.assertIsNone(users.show_token("boss", ids["desktop"]))
+        self.assertIsNone(users.show_link("meier"))
+        self.assertEqual(users.by_token(mcp).name, "boss")       # used: kept again
+        self.assertEqual(users.show_token("boss", ids["desktop"]), mcp)
+        self.assertIsNone(users.show_token("boss", ids["laptop"]))
+        self.assertIsNotNone(users.by_link(link))
+        self.assertEqual(users.show_link("meier"), link)
+        # Swap the copies of two rows: neither opens.
+        db = users._db
+        a, b = (db.execute("SELECT hash, secret FROM tokens WHERE label = ?", (n,)).fetchone()
+                for n in ("desktop", "laptop"))
+        db.execute("UPDATE tokens SET secret = ? WHERE hash = ?", (a["secret"], b["hash"]))
+        self.assertIsNone(users.show_token("boss", ids["laptop"]))
+        self.assertEqual(users.by_token(other).name, "boss")
+
+    def test_token_key_from_env(self):
+        with mock.patch.dict(os.environ, {"TOKEN_KEY": "k" * 20}):
+            users = Users(Path(self.tmp.name) / "env" / "users.db")
+            users.ensure_admin("boss", "secret-pass")
+            mcp = users.create_token("boss", "d")
+            self.assertEqual(users.show_token("boss", users.tokens("boss")[0]["id"]), mcp)
+        self.assertFalse((Path(self.tmp.name) / "env" / "token.key").exists())   # no file
+        with mock.patch.dict(os.environ, {"TOKEN_KEY": "short"}):
+            self.assertRaises(SystemExit, Users, Path(self.tmp.name) / "env2.db")
+
     def test_owner(self):
         self.users.ensure_admin("boss", "secret-pass")
         self.users.create("anna", "anna-pass", "admin")
@@ -526,6 +583,35 @@ class ViewerLoginTest(unittest.TestCase):
                             "role": "user", "csrf": token}, boss)
         self.assertEqual(self.req("/account", cookie=link)[0], 403)
         self.assertEqual(self.req("/account", cookie=self.login("meier", "meier-pass"))[0], 200)
+
+    def test_show_again_in_pages(self):
+        boss = self.login("boss", "boss-password")
+        token = self.csrf(self.req("/admin", cookie=boss)[2])
+        page = self.req("/admin", {"action": "link_create", "name": "meier",
+                                   "csrf": token}, boss)[2]
+        secret = re.search(r"/t/(itv_[\w-]+)", page).group(1)
+        page = self.req("/admin", cookie=boss)[2]
+        self.assertIn("Show link", page)
+        self.assertNotIn(secret, page)                   # only when asked for
+        status, _, page = self.req("/admin", {"action": "link_show", "name": "meier",
+                                              "csrf": token}, boss)
+        self.assertEqual(status, 200, page)
+        self.assertIn("/t/" + secret, page)
+        # One's own MCP token.
+        status, _, page = self.req("/account", {"action": "token", "label": "desk",
+                                                "csrf": token}, boss)
+        mcp = re.search(r"(itz_[\w-]+)", page).group(1)
+        page = self.req("/account", cookie=boss)[2]
+        self.assertNotIn(mcp, page)
+        tid = re.search(r'name="action" value="show">'
+                        r'<input type="hidden" name="id" value="([0-9a-f]{12})"', page).group(1)
+        status, _, page = self.req("/account", {"action": "show", "id": tid,
+                                                "csrf": token}, boss)
+        self.assertEqual(status, 200, page)
+        self.assertIn(mcp, page)
+        status, _, page = self.req("/account", {"action": "show", "id": "0" * 12,
+                                                "csrf": token}, boss)
+        self.assertEqual(status, 400)
 
     def test_access_link_free_name(self):
         boss = self.login("boss", "boss-password")

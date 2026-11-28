@@ -131,6 +131,7 @@ All settings are environment variables. See [`.env.example`](.env.example) for t
 | `MCP_ENGINE_URL` | compose: `http://mcp-engine:8766` | The gateway's engine (required) |
 | `ENGINE_URLS` | compose: `http://viewer-engine:8766` | The viewer's render engines, comma-separated, one render worker each (required; see [How it works](#how-it-works)) |
 | `ENGINE_TOKEN` / `MCP_ENGINE_TOKEN` | – | The secret the viewer / the MCP gateway shares with its engine (at least 16 characters); unset: the engine makes one in its `*-secret` volume (`ENGINE_TOKEN_FILE`) |
+| `TOKEN_KEY` / `TOKEN_KEY_FILE` | `token.key` next to `users.db` | The key that lets users see their tokens again (at least 16 characters; see [Users](#users)); set it as a secret to keep it apart from the volume |
 | `VIEWER_TITLE` | `IngeTrazo` | The headline (overview, login page, browser tab); admins can change it at `/admin` → *Title* |
 | `VIEWER_SHEET_DPI` | `120` | Sheet image resolution |
 | `VIEWER_NAV_MODE` | `tree` | How the View / 3D / Sheet dropdowns show folders by default: `tree` (one level at a time) or `list` (all levels); each user can switch (kept in their settings) |
@@ -328,7 +329,7 @@ The users live in one SQLite file, `users.db`, on the volume `users` that both s
   decides for a folder or model.
 - **Web and MCP separately**: each user has two switches in the panel, *Web* (the viewer) and *MCP* (the MCP
   server). New users get *Web* only; admins keep *Web*. A user with *MCP* makes personal tokens at `/account`
-  (`Authorization: Bearer itz_…`, for `MCP_AUTH=token`), or logs in on the OAuth consent page (`MCP_AUTH=oauth`)
+  (`Authorization: Bearer itz_…`, for `MCP_AUTH=token`) and can *Show* them there again later, or logs in on the OAuth consent page (`MCP_AUTH=oauth`)
   with their name and password. Over MCP they list, open and use only what their folders allow, and save and
   export only where they have *Read & write*; `run_python` is for admins only, since Python in the container
   reaches every file. There is one IngeTrazo and one open document for all callers: a tool on a document the
@@ -339,12 +340,18 @@ The users live in one SQLite file, `users.db`, on the volume `users` that both s
   else (shared by all guests), is never an admin, and an admin can switch it off in the panel without restarting.
   `VIEWER_AUTH_MODE=none` stays the viewer without any login.
 - **Access links** (for the `local` and `oidc` logins): at `/admin` → *Access links* an admin names a link (e.g.
-  *Carpenter Meier*), optionally with a last day, and gets its address `https://…/t/itv_…` once. Opening it logs
+  *Carpenter Meier*), optionally with a last day, and gets its address `https://…/t/itv_…`; *Show link* shows it
+  again later. Opening it logs
   the browser in as that link, without a password; scripts send the token as `Authorization: Bearer itv_…`. A
   link is an account of its own: it has its own *Folders* (none until the admin chooses some), may use the web
   viewer only (never MCP, never admin), and everyone with the link shares its settings. *New link* replaces the
   address (the old one and its sessions stop working at once), *Switch off*, the last day and *Remove* end it
-  too. The token is kept hashed, never written to the log, and dropped from the address after the login.
+  too. The token is never written to the log and is dropped from the address after the login.
+- **Showing tokens again**: tokens (MCP and access links) are checked by their hash; next to it the list keeps the
+  token encrypted, with a key outside the database: `TOKEN_KEY`, or else the file `token.key` next to `users.db`
+  (made on the first start, in the `users` volume both services share). A copy of `users.db` alone gives away no
+  token; whoever has the volume can read them, so back it up like a password store. With a new key the tokens keep
+  working, but show only after their next use. Tokens made before this feature show after their next use, too.
 - **Settings per user**: what a user switches in the viewer is kept with them, in the user list, and follows them
   to any browser: list or tree in the dropdowns (default `VIEWER_NAV_MODE`), edges in the 3D view. `/account` shows
   them, with *Default* to go back to the container's. Without an account (`VIEWER_AUTH_MODE=none`) the browser
