@@ -328,6 +328,9 @@ class Auth:
         if self.mode == "local":
             if password and self.users.ensure_admin(self.user_name, password):
                 log(f"viewer: first admin {self.user_name!r} from ADMIN_USER / ADMIN_PASSWORD")
+            # The owner: always an admin, restored on every start.
+            if self.users.protect_owner(self.user_name):
+                log(f"viewer: owner {self.users.owner!r} (ADMIN_USER)")
             if old:
                 log(f"viewer: {' / '.join(old)} is the old name; "
                     + " / ".join(k.replace("VIEWER_", "ADMIN_") for k in old) + " is the new one")

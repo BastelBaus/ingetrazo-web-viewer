@@ -45,6 +45,9 @@ SPECIAL = ("guest", "link")
 GUEST = "guest"
 #: A name: letters, digits and . _ - @ (e-mail addresses from a provider).
 NAME = re.compile(r"^[\w.@+-]{1,64}$", re.UNICODE)
+#: An access link's name: free text (spaces too), 1–64 characters, no
+#: control characters; runs of white space become one space.
+LINK_NAME = re.compile(r"^[^\x00-\x1f\x7f]{1,64}$")
 MIN_PASSWORD = 8
 
 #: Each entry upgrades the schema by one version.
@@ -190,6 +193,9 @@ class Users:
                          or state / "users.db")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
+        #: The owner (the admin from ADMIN_USER, local login): always an
+        #: active admin; nobody can demote, switch off or remove them.
+        self.owner: str | None = None
         self._db = sqlite3.connect(self.path, check_same_thread=False,
                                    isolation_level=None, timeout=10)
         self._db.row_factory = sqlite3.Row
@@ -312,6 +318,26 @@ class Users:
             raise UserError(f"{acc.name} logs in through {acc.source}; the password is kept there")
         return acc
 
+    def is_owner(self, acc: Account | None) -> bool:
+        return bool(acc and self.owner and acc.name.lower() == self.owner.lower())
+
+    def _not_owner(self, acc: Account, what: str) -> None:
+        if self.is_owner(acc):
+            raise UserError(f"{acc.name} is the owner (ADMIN_USER) and cannot be {what}")
+
+    def protect_owner(self, name: str) -> bool:
+        """``name`` (ADMIN_USER) becomes the owner: restored to an active
+        admin with the web viewer if it is a local user. True when it is."""
+        acc = self.get(name)
+        if acc is None or acc.source != "local":
+            self.owner = None
+            return False
+        self.owner = acc.name
+        with self._lock:
+            self._db.execute("UPDATE users SET role = 'admin', active = 1, web = 1 "
+                             "WHERE name = ?", (acc.name,))
+        return True
+
     def _keeps_an_admin(self, acc: Account) -> None:
         if acc.admin and acc.active and self.active_admins() <= 1:
             raise UserError("that would leave no active admin")
@@ -324,6 +350,7 @@ class Users:
             raise UserError(f"{'the guest user' if acc.source == 'guest' else 'an access link'} "
                             "cannot be an admin")
         if role != "admin":
+            self._not_owner(acc, "made a user")
             self._keeps_an_admin(acc)
         with self._lock:
             self._db.execute("UPDATE users SET role = ? WHERE name = ?", (role, acc.name))
@@ -331,6 +358,7 @@ class Users:
     def set_active(self, name: str, active: bool) -> None:
         acc = self._require(name)
         if not active:
+            self._not_owner(acc, "switched off")
             self._keeps_an_admin(acc)
         with self._lock:
             self._db.execute("UPDATE users SET active = ? WHERE name = ?",
@@ -340,6 +368,7 @@ class Users:
         acc = self._require(name)
         if acc.source == "guest":
             raise UserError("the guest user stays; switch it off instead")
+        self._not_owner(acc, "removed")
         self._keeps_an_admin(acc)
         with self._lock:
             self._db.execute("DELETE FROM users WHERE name = ?", (acc.name,))
@@ -503,9 +532,9 @@ class Users:
     def create_link(self, name: str, expires: str | None = None) -> tuple[Account, str]:
         """A new access link: an account ``name`` (web viewer only, no
         folders yet) and its token, shown once and kept hashed."""
-        name = name.strip()
-        if not NAME.match(name):
-            raise UserError("a name is 1–64 letters, digits or . _ - @ +")
+        name = " ".join(name.split())
+        if not LINK_NAME.match(name):
+            raise UserError("a link's name is 1–64 characters")
         if name.lower() == GUEST:
             raise UserError(f"the name {GUEST!r} is kept for the guest user")
         day = _check_date(expires)

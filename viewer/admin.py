@@ -9,7 +9,9 @@ set a local user's password, give them folders (``/admin/shares``, see
 mcp_http/shares.py), and remove users. They also hand out access links:
 a named account for the web viewer only, opened with a link
 (``/t/<token>``), with its own folders and an optional last day. The list always keeps one
-active admin, and an admin cannot switch themself off or remove themself.
+active admin; an admin cannot switch themself off, remove themself or
+take away their own admin role. The owner (``ADMIN_USER``, local login)
+always stays an active admin.
 """
 from __future__ import annotations
 
@@ -91,7 +93,7 @@ def _messages(note: str, error: str) -> str:
         return ('<div class="note">Your new token – copy it now, it is shown only once:'
                 f'<div class="token">{escape(note[6:])}</div></div>')
     if note.startswith("LINK:"):               # a new access link: shown once
-        name, _, token = note[5:].partition(":")
+        name, _, token = note[5:].rpartition(":")   # a name may hold ":"
         path = "/t/" + token
         return ('<div class="note">The access link for <strong>' + escape(name)
                 + '</strong> – copy it now, it is shown only once:'
@@ -126,8 +128,15 @@ def page(auth, user, note: str = "", error: str = "", title: str = "") -> bytes:
             continue
         me = acc.name.lower() == user.name.lower()
         acts = []
+        owner = auth.users.is_owner(acc)
         if acc.source == "guest":
             role = f'{acc.role} <span class="muted">(guest)</span>'
+        elif owner:
+            role = (f'{acc.role} <span class="muted" title="ADMIN_USER: always an admin">'
+                    '(owner)</span>')
+        elif me and acc.admin:
+            role = (f'{acc.role} <span class="muted" title="Another admin can change your '
+                    'role">(you)</span>')
         elif by_group and acc.source != "local":
             role = f'{acc.role} <span class="muted">(group)</span>'
         else:
@@ -159,7 +168,7 @@ def page(auth, user, note: str = "", error: str = "", title: str = "") -> bytes:
                  f"{sum(1 for x in acc.shares if x['access'] != 'none')} shared")
             acts.append(f'<a class="btn" href="/admin/shares?name={quote(acc.name)}">'
                         f'Folders <span class="muted">({n})</span></a>')
-        if not me:
+        if not me and not owner:
             acts.append(_form(auth, user, "active", acc.name,
                               f'<input type="hidden" name="on" value="{0 if acc.active else 1}">'
                               f'<button>{"Switch off" if acc.active else "Switch on"}</button>'))
@@ -373,6 +382,9 @@ def act(auth, user, form: dict) -> tuple[str, str]:
             acc = users.create(name, get("password"), get("role") or "user")
             return f"Added {acc.name}.", ""
         if action == "role":
+            if me and get("role") != "admin" and user.admin:
+                raise UserError("you cannot take away your own admin role; "
+                                "another admin can")
             acc = users.get(name)
             if acc and auth.admin_group and acc.source != "local":
                 raise UserError(f"the group {auth.admin_group} decides {acc.name}'s role")

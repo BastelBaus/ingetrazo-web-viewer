@@ -164,6 +164,15 @@ class UsersTest(unittest.TestCase):
         self.assertIsNone(self.users.by_link(newer))
         self.assertIsNone(self.users.link_info("meier"))
 
+    def test_access_link_names(self):
+        self.users.ensure_admin("boss", "secret-pass")
+        acc, token = self.users.create_link("  Schreinerei   Meier: Küche & Bad ")
+        self.assertEqual(acc.name, "Schreinerei Meier: Küche & Bad")
+        self.assertEqual(self.users.by_link(token)[0].name, acc.name)
+        for bad in ("", "   ", "x" * 65, "a\x00b"):
+            with self.assertRaises(UserError):
+                self.users.create_link(bad)
+
     def test_mcp_tokens_untouched_by_links(self):
         self.users.ensure_admin("boss", "secret-pass")
         mcp = self.users.create_token("boss", "desktop")
@@ -171,6 +180,28 @@ class UsersTest(unittest.TestCase):
         self.assertEqual(self.users.by_token(mcp).name, "boss")
         self.assertEqual(len(self.users.tokens("boss")), 1)
         self.assertIsNone(self.users.by_link(mcp))
+
+    def test_owner(self):
+        self.users.ensure_admin("boss", "secret-pass")
+        self.users.create("anna", "anna-pass", "admin")
+        self.assertTrue(self.users.protect_owner("BOSS"))
+        self.assertEqual(self.users.owner, "boss")
+        for change in (lambda: self.users.set_role("boss", "user"),
+                       lambda: self.users.set_active("boss", False),
+                       lambda: self.users.delete("boss"),
+                       lambda: self.users.set_rights("boss", web=False)):
+            with self.assertRaises(UserError):
+                change()
+        self.users.set_role("anna", "user")                       # other admins: yes
+        # Demoted behind its back (an older viewer): restored on start.
+        with self.users._lock:
+            self.users._db.execute("UPDATE users SET role = 'user', active = 0 WHERE name = 'boss'")
+        self.assertTrue(self.users.protect_owner("boss"))
+        acc = self.users.get("boss")
+        self.assertEqual((acc.role, acc.active, acc.web), ("admin", True, True))
+        # Unknown or not local: no owner.
+        self.assertFalse(self.users.protect_owner("nobody"))
+        self.assertIsNone(self.users.owner)
 
     def test_guest(self):
         self.users.ensure_admin("boss", "secret-pass")
@@ -399,7 +430,12 @@ class ViewerLoginTest(unittest.TestCase):
         status, _, page = self.req("/admin", {"action": "role", "name": "boss",
                                               "role": "user", "csrf": token}, boss)
         self.assertEqual(status, 400)
-        self.assertIn("no active admin", page)
+        self.assertIn("own admin role", page)                     # refused before that
+        # The list itself still keeps one active admin.
+        users = self.server.auth.users
+        users.owner = None
+        with self.assertRaisesRegex(UserError, "no active admin"):
+            users.set_role("boss", "user")
 
     def test_change_own_password(self):
         boss = self.login("boss", "boss-password")
@@ -491,6 +527,24 @@ class ViewerLoginTest(unittest.TestCase):
         self.assertEqual(self.req("/account", cookie=link)[0], 403)
         self.assertEqual(self.req("/account", cookie=self.login("meier", "meier-pass"))[0], 200)
 
+    def test_access_link_free_name(self):
+        boss = self.login("boss", "boss-password")
+        token = self.csrf(self.req("/admin", cookie=boss)[2])
+        name = "Carpenter Meier: kitchen & <bath>"
+        status, _, page = self.req("/admin", {"action": "link_create", "name": name,
+                                              "csrf": token}, boss)
+        self.assertEqual(status, 200, page)
+        secret = re.search(r"/t/(itv_[\w-]+)", page).group(1)
+        self.assertIn("Carpenter Meier: kitchen &amp; &lt;bath&gt;", page)
+        self.assertNotIn("<bath>", page)
+        from urllib.parse import quote
+        self.assertEqual(self.req("/admin/shares?name=" + quote(name), cookie=boss)[0], 200)
+        link = self.req("/t/" + secret)[1]["Set-Cookie"].split(";")[0]
+        status, _, page = self.req("/account", cookie=link)
+        self.assertEqual(status, 200)
+        self.assertIn("Carpenter Meier: kitchen &amp; &lt;bath&gt;", page)
+        self.assertEqual(self.req("/avatar/" + quote(name) + ".svg", cookie=link)[0], 200)
+
     def test_access_link_logout_and_log(self):
         boss = self.login("boss", "boss-password")
         token = self.csrf(self.req("/admin", cookie=boss)[2])
@@ -547,6 +601,29 @@ class ViewerLoginTest(unittest.TestCase):
         self.assertIn("attachment", headers["Content-Disposition"])
         kinds = {json.loads(line)["kind"] for line in text.splitlines()}
         self.assertEqual(kinds, {"admin"})
+
+    def test_admin_cannot_lock_themself_out(self):
+        boss = self.login("boss", "boss-password")
+        token = self.csrf(self.req("/admin", cookie=boss)[2])
+        self.req("/admin", {"action": "create", "name": "anna", "password": "anna-pass",
+                            "role": "admin", "csrf": token}, boss)
+        page = self.req("/admin", cookie=boss)[2]
+        self.assertIn("(owner)", page)
+        anna = self.login("anna", "anna-pass")
+        atoken = self.csrf(self.req("/admin", cookie=anna)[2])
+        # anna cannot demote herself, nor the owner.
+        page = self.req("/admin", {"action": "role", "name": "anna", "role": "user",
+                                   "csrf": atoken}, anna)[2]
+        self.assertIn("own admin role", page)
+        for data in ({"action": "role", "role": "user"}, {"action": "active", "on": "0"},
+                     {"action": "delete"}):
+            status, _, page = self.req("/admin", {**data, "name": "boss", "csrf": atoken}, anna)
+            self.assertEqual(status, 400, data)
+            self.assertIn("owner", page)
+        self.assertEqual(self.req("/admin", cookie=anna)[0], 200)   # still admin
+        # The owner can demote anna.
+        self.req("/admin", {"action": "role", "name": "anna", "role": "user", "csrf": token}, boss)
+        self.assertEqual(self.req("/admin", cookie=anna)[0], 403)
 
     def test_guest_login(self):
         from viewer import auth as auth_mod
