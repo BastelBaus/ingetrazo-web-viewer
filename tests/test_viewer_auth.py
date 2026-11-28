@@ -71,6 +71,19 @@ class SessionsTest(unittest.TestCase):
         for value in ("é.é", "a.ÿ", "\u00e9.x"):
             self.assertIsNone(self.s.read(value), value)
 
+    def test_revoke(self):
+        a, b = self.s.issue(User("anna")), self.s.issue(User("anna"))
+        self.assertTrue(self.s.revoke(a))
+        self.assertIsNone(self.s.read(a))
+        self.assertEqual(self.s.read(b), User("anna"))              # her other session
+        self.assertFalse(self.s.revoke(a))                          # once
+        self.assertFalse(self.s.revoke("forged.value"))
+        self.assertFalse(self.s.revoke(Sessions(1).issue(User("anna"))))
+        # Revoked ids are forgotten once those sessions would have expired.
+        with mock.patch.object(viewer_auth.time, "time", return_value=time.time() + 86401):
+            self.s.revoke(self.s.issue(User("bob")))
+        self.assertEqual(len(self.s._revoked), 1)
+
     def test_csrf_per_user_and_start(self):
         self.assertEqual(self.s.csrf("anna"), self.s.csrf("anna"))
         self.assertNotEqual(self.s.csrf("anna"), self.s.csrf("bob"))

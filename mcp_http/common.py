@@ -49,3 +49,12 @@ def must_close(handler, status: int) -> bool:
     if length <= 0:
         return False
     return handler.command != "POST" or status >= 300
+
+
+def content_length(headers) -> int | None:
+    """A request's Content-Length: 0 without one, None when it is not a
+    number (a bad request, never a crash)."""
+    raw = (headers.get("Content-Length") or "0").strip() if headers is not None else "0"
+    if not raw.isdigit():
+        return None
+    return int(raw)

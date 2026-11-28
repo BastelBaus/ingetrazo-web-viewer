@@ -136,7 +136,12 @@ def record(kind: str, **fields) -> None:
             f.parent.mkdir(parents=True, exist_ok=True)
             if f.exists() and f.stat().st_size + len(line) > max_bytes() > 0:
                 _rotate(f)
-            with f.open("a", encoding="utf-8") as out:
+            # Owner only (IP addresses are personal data); also a file an
+            # older version made with the umask.
+            fd = os.open(f, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            with os.fdopen(fd, "a", encoding="utf-8") as out:
+                if os.fstat(fd).st_mode & 0o077:
+                    os.fchmod(fd, 0o600)
                 out.write(line)
     except OSError:
         pass

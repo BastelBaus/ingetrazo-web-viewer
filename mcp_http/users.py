@@ -208,7 +208,20 @@ class Users:
         self._db.row_factory = sqlite3.Row
         self._db.execute("PRAGMA journal_mode=WAL")
         self._migrate()
+        self._private()
         self._vault = vault.Vault(vault.load_key(self.path))
+
+    def _private(self) -> None:
+        """The list holds password and token hashes: owner only (0600),
+        also for a database an older version made with the umask. Its
+        journal files (-wal, -shm) take the database's mode."""
+        for f in (self.path, self.path.with_name(self.path.name + "-wal"),
+                  self.path.with_name(self.path.name + "-shm")):
+            try:
+                if f.exists() and f.stat().st_mode & 0o077:
+                    os.chmod(f, 0o600)
+            except OSError:
+                pass
 
     def _migrate(self) -> None:
         with self._lock:

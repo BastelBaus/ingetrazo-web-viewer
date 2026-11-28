@@ -550,6 +550,18 @@ class HttpFlowTest(Base):
         status, _, page = self.req("/authorize", b"tx=nope&decision=allow")
         self.assertEqual(status, 400)
 
+    def test_bodies_too_large_or_with_a_bad_length(self):
+        import socket
+        port = self.httpd.server_address[1]
+        for path in ("/register", "/token", "/authorize"):
+            for length in ("70000", "abc"):
+                with socket.create_connection(("127.0.0.1", port), timeout=3) as c:
+                    c.sendall(f"POST {path} HTTP/1.1\r\nHost: x\r\n"
+                              f"Content-Length: {length}\r\n\r\n".encode())
+                    got = c.recv(4096)
+                self.assertRegex(got[:12], rb"HTTP/1\.1 (400|413)", (path, length))
+        self.assertEqual(self.o.store.clients, {})
+
     def test_error_redirect_to_the_client(self):
         c = self.client(uris=("http://127.0.0.1:9/cb",))
         status, headers, _ = self.req("/authorize?" + urlencode({

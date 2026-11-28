@@ -7,9 +7,9 @@ needed:
 
     python -m unittest discover -s tests -p "test_*.py"
 
-Tests marked ``expectedFailure`` document a gap that is still open (see
-the docstring); they turn into an error once it is closed, so the marker
-goes then.
+A gap that is still open gets a test marked ``expectedFailure`` (its
+docstring says what is open); it turns into an error once the gap is
+closed, so the marker goes then.
 """
 from __future__ import annotations
 
@@ -486,24 +486,41 @@ class HeadersTest(Viewer):
             _, headers, _ = self.req(path, cookie=boss)
             self.assertEqual(headers["Cache-Control"], "no-store", path)
 
-    @unittest.expectedFailure
-    def test_pages_cannot_be_framed(self):
-        """Open: the viewer's pages (admin panel included) send neither
-        X-Frame-Options nor a CSP frame-ancestors, so another site can
-        frame them (clickjacking). The MCP consent page does."""
+    def test_pages_cannot_be_framed_by_other_sites(self):
+        """Clickjacking of the admin panel: only the viewer itself may frame
+        its pages (VIEWER_FRAME_ANCESTORS widens or narrows that)."""
         boss = self.login("boss", "boss-password")
-        for path in ("/login", "/", "/admin", "/account"):
+        for path in ("/login", "/", "/admin", "/account", "/nowhere"):
             _, headers, _ = self.req(path, cookie=boss)
-            framing = (headers.get("X-Frame-Options", "")
-                       + headers.get("Content-Security-Policy", ""))
-            self.assertRegex(framing, r"(?i)deny|sameorigin|frame-ancestors", path)
+            self.assertEqual(headers["X-Frame-Options"], "SAMEORIGIN", path)
+            self.assertEqual(headers["Content-Security-Policy"], "frame-ancestors 'self'", path)
+            self.assertEqual(headers["Referrer-Policy"], "same-origin", path)
 
-    @unittest.expectedFailure
+    def test_frame_ancestors_setting(self):
+        from viewer.server import security_headers
+        for raw, xfo, csp in (
+                ("none", "DENY", "frame-ancestors 'none'"),
+                ("*", None, None),
+                ("https://ha.example.org, http://wiki.lan:8123",
+                 None, "frame-ancestors 'self' https://ha.example.org http://wiki.lan:8123"),
+                ("https://ha.example.org; script-src *", None,           # no CSP injection
+                 "frame-ancestors 'self' https://ha.example.org")):
+            with mock.patch.dict(os.environ, {"VIEWER_FRAME_ANCESTORS": raw}):
+                h = security_headers()
+            self.assertEqual(h.get("X-Frame-Options"), xfo, raw)
+            self.assertEqual(h.get("Content-Security-Policy"), csp, raw)
+            self.assertEqual(h["X-Content-Type-Options"], "nosniff")
+
     def test_no_sniffing(self):
-        """Open: no X-Content-Type-Options: nosniff on files and pages."""
         boss = self.login("boss", "boss-password")
-        _, headers, _ = self.req(self.file_url("p/house.igz"), cookie=boss)
-        self.assertEqual(headers.get("X-Content-Type-Options"), "nosniff")
+        for path in (self.file_url("p/house.igz"), "/", "/version", "/healthz"):
+            _, headers, _ = self.req(path, cookie=boss)
+            self.assertEqual(headers.get("X-Content-Type-Options"), "nosniff", path)
+
+    def test_the_access_link_keeps_its_own_referrer_policy(self):
+        _, token = self.server.auth.users.create_link("Visitor")
+        _, headers, _ = self.req(f"/t/{token}")
+        self.assertEqual(headers.get_all("Referrer-Policy"), ["no-referrer"])
 
 
 class GatewayDesyncTest(unittest.TestCase):
@@ -559,25 +576,131 @@ class StorageTest(Viewer):
         entries = [json.loads(line) for line in lines]           # every line is JSON
         self.assertFalse([e for e in entries if e.get("kind") == "admin"])
 
-    @unittest.expectedFailure
     def test_private_files_are_not_world_readable(self):
-        """Open: users.db (password and token hashes) and audit.log (IP
-        addresses) are made with the process umask (0644); oauth.json and
-        the engine's secret are 0600."""
+        """users.db (password and token hashes) and audit.log (IP
+        addresses): owner only, like oauth.json and the secrets."""
         self.req("/login", {"user": "boss", "password": "wrong"})
-        for f in (Path(os.environ["USERS_DB"]), self.audit_file):
-            self.assertEqual(f.stat().st_mode & 0o077, 0, f.name)
+        db = Path(os.environ["USERS_DB"])
+        for f in (db, Path(str(db) + "-wal"), self.audit_file):
+            if f.exists():
+                self.assertEqual(f.stat().st_mode & 0o077, 0, f.name)
 
-    @unittest.expectedFailure
+    def test_files_of_an_older_version_are_made_private(self):
+        from mcp_http.users import Users
+        from viewer import audit
+        db = Path(os.environ["USERS_DB"])
+        audit.record("access", path="/first")
+        os.chmod(db, 0o644)
+        os.chmod(self.audit_file, 0o644)
+        Users(db)                                             # the next start
+        audit.record("access", path="/x")                     # the next entry
+        self.assertEqual(db.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.audit_file.stat().st_mode & 0o777, 0o600)
+
     def test_logout_ends_the_session_everywhere(self):
-        """Open: sessions are signed cookies without a server-side list, so
-        logging out only drops the cookie in this browser; a copy of it
-        stays valid until it expires (VIEWER_SESSION_DAYS) or the viewer
-        restarts. Switching the user off or changing their role does end
-        it at once."""
+        """Logging out ends that session, also a copy of its cookie; the
+        user's other sessions stay."""
         boss = self.login("boss", "boss-password")
+        other = self.login("boss", "boss-password")            # another browser
+        self.assertEqual(self.req("/admin", cookie=boss)[0], 200)
         self.req("/logout", cookie=boss)
-        self.assertNotEqual(self.req("/admin", cookie=boss)[0], 200)
+        self.assertEqual(self.req("/admin", cookie=boss)[0], 303)
+        self.assertEqual(self.req("/admin", cookie=other)[0], 200)
+
+
+class ThrottleTest(Viewer):
+    """Wrong passwords and access links per client address
+    (viewer/auth.py Throttle, VIEWER_LOGIN_LIMIT)."""
+
+    EXTRA_ENV = {"VIEWER_LOGIN_LIMIT": "3", "VIEWER_TRUSTED_PROXIES": "127.0.0.1/32"}
+
+    def wrong(self, n, addr="203.0.113.7"):
+        for _ in range(n):
+            status = self.req("/login", {"user": "boss", "password": "wrong"},
+                              headers={"X-Forwarded-For": addr})[0]
+        return status
+
+    def setUp(self):
+        super().setUp()
+        self.sleep = mock.patch("viewer.server.time.sleep")
+        self.sleep.start()
+
+    def tearDown(self):
+        self.sleep.stop()
+        super().tearDown()
+
+    def test_login(self):
+        self.assertEqual(self.wrong(3), 401)
+        status, headers, page = self.req("/login", {"user": "boss", "password": "boss-password"},
+                                         headers={"X-Forwarded-For": "203.0.113.7"})
+        self.assertEqual(status, 429)                         # not even the right one
+        self.assertIn("Too many wrong passwords", page)
+        self.assertGreater(int(headers["Retry-After"]), 0)
+        # Another address is not affected.
+        status, _, _ = self.req("/login", {"user": "boss", "password": "boss-password"},
+                                headers={"X-Forwarded-For": "198.51.100.9"})
+        self.assertEqual(status, 303)
+        log = self.audit_file.read_text()
+        self.assertIn('"status": 429', log)
+
+    def test_access_links_and_scripts(self):
+        import base64
+        for _ in range(3):
+            self.req("/t/itv_made-up", headers={"X-Forwarded-For": "203.0.113.8"})
+        _, token = self.server.auth.users.create_link("Visitor")
+        status, _, page = self.req(f"/t/{token}", headers={"X-Forwarded-For": "203.0.113.8"})
+        self.assertEqual(status, 429)
+        self.assertIn("Too many wrong access links", page)
+        # Basic auth of scripts counts and is refused the same way.
+        bad = base64.b64encode(b"boss:wrong").decode()
+        good = base64.b64encode(b"boss:boss-password").decode()
+        for _ in range(3):
+            self.req("/version", headers={"Authorization": f"Basic {bad}",
+                                          "X-Forwarded-For": "203.0.113.9"}, accept="*/*")
+        self.assertEqual(self.req("/version", headers={"Authorization": f"Basic {good}",
+                                                       "X-Forwarded-For": "203.0.113.9"},
+                                  accept="*/*")[0], 401)
+        self.assertEqual(self.req("/version", headers={"Authorization": f"Basic {good}"},
+                                  accept="*/*")[0], 200)
+
+    def test_the_window_passes(self):
+        from viewer.auth import Throttle
+        with mock.patch.dict(os.environ, {"VIEWER_LOGIN_LIMIT": "2", "VIEWER_LOGIN_WINDOW": "60"}):
+            t = Throttle()
+        now = [1000.0]
+        with mock.patch("viewer.auth.time.time", lambda: now[0]):
+            t.failed("a")
+            now[0] += 10
+            t.failed("a")
+            self.assertEqual(t.wait("a"), 51)
+            self.assertEqual(t.wait("b"), 0)
+            now[0] += 51
+            self.assertEqual(t.wait("a"), 0)                  # the first failure is out
+        with mock.patch.dict(os.environ, {"VIEWER_LOGIN_LIMIT": "0"}):
+            off = Throttle()
+        for _ in range(100):
+            off.failed("a")
+        self.assertEqual(off.wait("a"), 0)
+        with mock.patch.dict(os.environ, {"VIEWER_LOGIN_LIMIT": "x"}):
+            with self.assertRaises(SystemExit):
+                Throttle()
+
+    def test_memory_is_bounded(self):
+        from viewer.auth import Throttle
+        t = Throttle()
+        with mock.patch.object(Throttle, "MAX_KEYS", 50):
+            for i in range(500):
+                t.failed(f"10.0.{i // 250}.{i % 250}")
+        self.assertLessEqual(len(t._fails), 50)
+
+
+class BodyTest(Viewer):
+    def test_bad_content_length_is_no_crash(self):
+        for value in ("abc", "-5", "1e3"):
+            got = raw_http(self.port, f"POST /login HTTP/1.1\r\nHost: x\r\n"
+                                      f"Content-Length: {value}\r\n\r\n".encode())
+            self.assertRegex(got[:12], rb"HTTP/1\.1 [1-5]\d\d", value)
+            self.assertNotIn(b"500", got[:12], value)
 
 
 class ShowAgainTest(Viewer):
@@ -667,17 +790,17 @@ class BruteForceTest(Viewer):
             self.assertGreaterEqual(time.monotonic() - t0, 0.6, path)
             self.assertIn(status, (401, 403))
 
-    @unittest.expectedFailure
     def test_parallel_guessing_is_throttled(self):
-        """Open: each wrong password costs its request 0.7 s, but nothing
-        counts them, so parallel requests guess as fast as the server
-        answers (the OAuth consent page stops after 20 in 15 minutes)."""
+        """Parallel requests guess no faster: past VIEWER_LOGIN_LIMIT (10)
+        every attempt from that address is refused."""
         import concurrent.futures
-        t0 = time.monotonic()
         with concurrent.futures.ThreadPoolExecutor(20) as pool:
-            list(pool.map(lambda i: self.req("/login", {"user": "boss",
-                                                        "password": f"guess-{i}"}), range(40)))
-        self.assertGreater(time.monotonic() - t0, 15)
+            got = list(pool.map(lambda i: self.req("/login", {
+                "user": "boss", "password": f"guess-{i}"})[0], range(40)))
+        self.assertLessEqual(got.count(401), 10 + 20)          # in flight when it tipped
+        self.assertGreaterEqual(got.count(429), 10)
+        self.assertEqual(self.req("/login", {"user": "boss", "password": "boss-password"})[0],
+                         429)
 
     def test_unknown_user_takes_as_long_as_a_wrong_password(self):
         users = self.server.auth.users

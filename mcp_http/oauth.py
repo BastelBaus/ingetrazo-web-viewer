@@ -34,7 +34,7 @@ from html import escape
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlsplit
 
-from .common import log
+from .common import content_length, log
 
 STATE_DIR = Path(os.environ.get("INGETRAZO_STATE", "/state"))
 #: claude.ai's and claude.com's connector callbacks, and any port on this
@@ -406,6 +406,12 @@ class OAuthServer:
         if method == "GET" and path.startswith(("/.well-known/oauth-authorization-server",
                                                 "/.well-known/openid-configuration")):
             return self._json(h, 200, self.server_metadata())
+        if method == "POST" and path in ("/register", "/token", "/authorize"):
+            length = content_length(h.headers)
+            if length is None or length > self.MAX_BODY:
+                return self._json(h, 413 if length else 400, {
+                    "error": "invalid_request",
+                    "error_description": "body too large or bad Content-Length"})
         if path == "/register" and method == "POST":
             try:
                 body = json.loads(self._body(h) or b"null")
@@ -455,10 +461,14 @@ class OAuthServer:
             return self._page(h, 401 if req else 400, body)
         return False
 
+    MAX_BODY = 65536
+
     @staticmethod
     def _body(h) -> bytes:
-        length = int(h.headers.get("Content-Length") or 0)
-        return h.rfile.read(min(length, 65536)) if length > 0 else b""
+        """The request body; route() has refused one too large or with a
+        bad Content-Length already, so it is always read in full."""
+        length = content_length(h.headers) or 0
+        return h.rfile.read(length) if length > 0 else b""
 
     def _json(self, h, status: int, obj: dict, extra: dict | None = None) -> bool:
         h._send(status, json.dumps(obj).encode(), "application/json",

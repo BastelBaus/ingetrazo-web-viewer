@@ -267,7 +267,13 @@ name (`sheet-003-120dpi.png`), so changing `VIEWER_SHEET_DPI` renders anew inste
 With `oidc` and `proxy` a user is added to the [user list](#users) on first login. There is no LDAP client in the
 container: user sources such as LDAP are configured in the identity provider.
 
-Sessions (`local`, `oidc`) last `VIEWER_SESSION_DAYS` (30) and end when the container restarts.
+Sessions (`local`, `oidc`) last `VIEWER_SESSION_DAYS` (30) and end when the container restarts. *Log out* ends
+the session itself, so a copy of its cookie stops working too; the user's other sessions stay.
+
+Wrong passwords and access links are counted per client address: after `VIEWER_LOGIN_LIMIT` (10) within
+`VIEWER_LOGIN_WINDOW` seconds (900) that address may not try again, not even with the right password, until the
+oldest failure is out of the window (`429`, `Retry-After`). `0` turns this off. Behind a reverse proxy set
+`VIEWER_TRUSTED_PROXIES` (see [Audit log](#audit-log)), otherwise all users share the proxy's address.
 
 ### Audit log
 
@@ -444,6 +450,13 @@ anyone else who can reach it could send the header themselves. With nginx, use `
 - the container runs as an unprivileged user, and only `/data`, `/cache` and `/state` are writable;
 - the viewer's render engine is reachable only on the internal `engine` network; its `ENGINE_TOKEN` (or the
   `engine-secret` volume) is as sensitive as `MCP_TOKEN`.
+
+The viewer's replies carry `X-Content-Type-Options: nosniff`, `Referrer-Policy: same-origin` and allow framing only
+by the viewer itself (`X-Frame-Options: SAMEORIGIN`, `frame-ancestors 'self'`), against clickjacking of the admin
+panel. To show the viewer in a frame elsewhere (a dashboard), name those origins in `VIEWER_FRAME_ANCESTORS`
+(`https://ha.example.org https://wiki.example.org`); `none` forbids every frame, `*` allows any. `users.db`,
+`token.key`, `oauth.json` and `audit.log` are readable by their owner only (0600). The MCP endpoint reads at most
+`MCP_MAX_BODY_MB` (16) per request.
 
 The path check on `open_document`/`save_document`/imports/exports keeps well-behaved agents inside the model
 folders, and out of writing to the `ro` ones. It is not a sandbox against `run_python`: mount `ro` folders

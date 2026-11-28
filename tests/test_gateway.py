@@ -194,6 +194,36 @@ class TransportTest(Base):
             self.assertEqual((status, reply["error"]["code"]), (400, -32600), body)
         self.assertEqual(self.app.seen, [])
 
+    def test_body_limit_and_bad_length(self):
+        import socket
+        port = self.httpd.server_address[1]
+
+        def raw(head):
+            with socket.create_connection(("127.0.0.1", port), timeout=3) as c:
+                c.sendall(head.encode())
+                got = b""
+                try:
+                    while chunk := c.recv(65536):
+                        got += chunk
+                except TimeoutError:
+                    pass
+            return got
+        auth = f"Authorization: Bearer {TOKEN}\r\n"
+        with mock.patch.object(server, "MAX_BODY", 1000):
+            got = raw(f"POST /mcp HTTP/1.1\r\nHost: x\r\n{auth}Content-Length: 5000\r\n\r\n")
+        self.assertTrue(got.startswith(b"HTTP/1.1 413"), got[:40])
+        self.assertIn(b"MCP_MAX_BODY_MB", got)
+        for value in ("abc", "-1", "1e3"):
+            got = raw(f"POST /mcp HTTP/1.1\r\nHost: x\r\n{auth}Content-Length: {value}\r\n\r\n")
+            self.assertTrue(got.startswith(b"HTTP/1.1 400"), (value, got[:40]))
+        self.assertEqual(self.app.seen, [])
+
+    def test_no_sniffing(self):
+        for path, body in (("/mcp", {"jsonrpc": "2.0", "id": 1, "method": "ping"}),
+                           ("/nowhere", None), ("/healthz", None)):
+            _, headers, _ = self.req(path, body=body)
+            self.assertEqual(headers.get("X-Content-Type-Options"), "nosniff", path)
+
     def test_notifications_and_responses(self):
         status, _, body = self.req(body={"jsonrpc": "2.0", "method": "notifications/initialized"})
         self.assertEqual((status, body), (202, None))
