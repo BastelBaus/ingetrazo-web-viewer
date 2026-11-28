@@ -53,6 +53,12 @@ def mcp(msg, token=TOKEN):
 
 
 def tool(name, **args):
+    """A tool call; every tool but list_documents names the live document."""
+    if name != "list_documents":
+        listing = json.loads(tool("list_documents")["content"][0]["text"])
+        live = listing["open_documents"]
+        if live and "document_id" in live[0]:
+            args.setdefault("document_id", live[0]["document_id"])
     status, reply = mcp({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
                          "params": {"name": name, "arguments": args}})
     assert status == 200, (name, status, reply)
