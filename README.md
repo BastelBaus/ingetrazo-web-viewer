@@ -143,6 +143,13 @@ All settings are environment variables. See [`.env.example`](.env.example) for t
 | `WEB_VIEWER_IMAGE` | `ghcr.io/bastelbaus/ingetrazo-web-viewer:latest` | This repo's image to pull (or tag to build) |
 | `WEB_VIEWER_REF` | `dev` | This repo's tag or commit for a local build; shown in the viewer's footer and at `/version` |
 
+## Related repositories
+
+![Repositories, users and features](docs/ecosystem.drawio.png)
+
+<sub>Overview of IngeTrazo, this repo, ingetrazo-docker and Félix Riestra's IngeTrazo Web. Editable: open
+`docs/ecosystem.drawio.png` or `docs/ecosystem.drawio` in [draw.io / diagrams.net](https://app.diagrams.net).</sub>
+
 ## How it works
 
 ![Architecture](docs/architecture.drawio.png)
