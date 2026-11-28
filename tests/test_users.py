@@ -116,6 +116,62 @@ class UsersTest(unittest.TestCase):
         self.assertEqual(u.get("old").config, {})
         u.set_settings("old", {"nav_mode": "list"})
 
+    def test_access_link(self):
+        self.users.ensure_admin("boss", "secret-pass")
+        acc, token = self.users.create_link("meier")
+        self.assertTrue(token.startswith("itv_"))
+        self.assertEqual((acc.source, acc.role, acc.web, acc.mcp, acc.shares),
+                         ("link", "user", True, False, []))       # no folders yet
+        found = self.users.by_link(token)
+        self.assertEqual(found[0].name, "meier")
+        self.assertTrue(self.users.link_usable(found[0], found[1]))
+        # Never MCP, never admin, no password, not an MCP token.
+        self.assertIsNone(self.users.by_token(token))
+        for change in (lambda: self.users.set_rights("meier", mcp=True),
+                       lambda: self.users.set_role("meier", "admin"),
+                       lambda: self.users.set_password("meier", "secret-pass"),
+                       lambda: self.users.create_token("meier"),
+                       lambda: self.users.seen("meier", "oidc", [], True),
+                       lambda: self.users.create_link("MEIER"),
+                       lambda: self.users.create_link("boss"),
+                       lambda: self.users.create_link("guest"),
+                       lambda: self.users.new_link("boss"),
+                       lambda: self.users.set_expires("meier", "2000-01-01"),
+                       lambda: self.users.set_expires("meier", "tomorrow")):
+            with self.assertRaises(UserError):
+                change()
+        self.assertIsNone(self.users.authenticate("meier", ""))
+        self.assertEqual(self.users.tokens("meier"), [])           # MCP tokens only
+        # A new link: the old one stops working.
+        newer = self.users.new_link("meier")
+        self.assertIsNone(self.users.by_link(token))
+        self.assertFalse(self.users.link_usable(self.users.get("meier"), found[1]))
+        self.assertIsNotNone(self.users.by_link(newer))
+        # Switched off, expired: no way in.
+        self.users.set_active("meier", False)
+        self.assertIsNone(self.users.by_link(newer))
+        self.users.set_active("meier", True)
+        self.users.set_expires("meier", "2999-12-31")
+        self.assertIsNotNone(self.users.by_link(newer))
+        with self.users._lock:
+            self.users._db.execute("UPDATE users SET expires = '2001-01-01' WHERE name = 'meier'")
+        self.assertTrue(self.users.get("meier").expired)
+        self.assertIsNone(self.users.by_link(newer))
+        self.assertIsNone(self.users.set_expires("meier", ""))     # no end
+        self.assertIsNotNone(self.users.by_link(newer))
+        # Removed: the token goes with it.
+        self.users.delete("meier")
+        self.assertIsNone(self.users.by_link(newer))
+        self.assertIsNone(self.users.link_info("meier"))
+
+    def test_mcp_tokens_untouched_by_links(self):
+        self.users.ensure_admin("boss", "secret-pass")
+        mcp = self.users.create_token("boss", "desktop")
+        self.users.create_link("meier")
+        self.assertEqual(self.users.by_token(mcp).name, "boss")
+        self.assertEqual(len(self.users.tokens("boss")), 1)
+        self.assertIsNone(self.users.by_link(mcp))
+
     def test_guest(self):
         self.users.ensure_admin("boss", "secret-pass")
         with self.assertRaises(UserError):
@@ -377,6 +433,78 @@ class ViewerLoginTest(unittest.TestCase):
                                                 "edges_3d": "0", "csrf": token}, boss)
         self.assertEqual(status, 200, page)
         self.assertIn('data-nav="tree" data-edges="0"', page)
+
+    def test_access_link_login(self):
+        boss = self.login("boss", "boss-password")
+        token = self.csrf(self.req("/admin", cookie=boss)[2])
+        status, _, page = self.req("/admin", {"action": "link_create", "name": "meier",
+                                              "expires": "", "csrf": token}, boss)
+        self.assertEqual(status, 200, page)
+        secret = re.search(r"/t/(itv_[\w-]+)", page).group(1)
+        self.assertIn("Choose its folders", page)
+        page = self.req("/admin", cookie=boss)[2]
+        self.assertIn("Access links", page)
+        self.assertIn("meier", page)
+        # The link logs in and drops the token from the address.
+        status, headers, _ = self.req("/t/" + secret)
+        self.assertEqual((status, headers["Location"]), (303, "/"))
+        self.assertEqual(headers["Referrer-Policy"], "no-referrer")
+        link = headers["Set-Cookie"].split(";")[0]
+        status, _, page = self.req("/account", cookie=link)
+        self.assertEqual(status, 200)
+        self.assertIn("access link <strong>meier</strong>", page)
+        self.assertNotIn("MCP access", page)
+        self.assertEqual(self.req("/admin", cookie=link)[0], 403)
+        # A wrong token: refused. A script: Bearer.
+        self.assertEqual(self.req("/t/itv_nope")[0], 403)
+        r = urllib.request.Request(self.base + "/account",
+                                   headers={"Authorization": "Bearer " + secret,
+                                            "Accept": "text/plain"})
+        with self.opener.open(r, timeout=10) as resp:
+            self.assertEqual(resp.status, 200)
+        # A new link ends the old link's sessions.
+        status, _, page = self.req("/admin", {"action": "link_new", "name": "meier",
+                                              "csrf": token}, boss)
+        newer = re.search(r"/t/(itv_[\w-]+)", page).group(1)
+        status, _, page = self.req("/account", cookie=link)
+        self.assertEqual(status, 403)
+        self.assertIn("access link no longer works", page)
+        self.assertEqual(self.req("/t/" + secret)[0], 403)
+        link = self.req("/t/" + newer)[1]["Set-Cookie"].split(";")[0]
+        self.assertEqual(self.req("/account", cookie=link)[0], 200)
+        # Last day and switch off.
+        status, _, page = self.req("/admin", {"action": "link_expires", "name": "meier",
+                                              "expires": "2999-12-31", "csrf": token}, boss)
+        self.assertIn("works through 2999-12-31", page)
+        self.req("/admin", {"action": "active", "name": "meier", "on": "0", "csrf": token}, boss)
+        self.assertEqual(self.req("/account", cookie=link)[0], 403)
+        self.assertEqual(self.req("/t/" + newer)[0], 403)
+        # No MCP right, no admin role through the panel.
+        page = self.req("/admin", {"action": "rights", "name": "meier", "mcp": "1",
+                                   "csrf": token}, boss)[2]
+        self.assertIn("web viewer only", page)
+        # A link session is never taken for a password user of that name.
+        self.req("/admin", {"action": "delete", "name": "meier", "csrf": token}, boss)
+        self.req("/admin", {"action": "create", "name": "meier", "password": "meier-pass",
+                            "role": "user", "csrf": token}, boss)
+        self.assertEqual(self.req("/account", cookie=link)[0], 403)
+        self.assertEqual(self.req("/account", cookie=self.login("meier", "meier-pass"))[0], 200)
+
+    def test_access_link_logout_and_log(self):
+        boss = self.login("boss", "boss-password")
+        token = self.csrf(self.req("/admin", cookie=boss)[2])
+        page = self.req("/admin", {"action": "link_create", "name": "meier",
+                                   "csrf": token}, boss)[2]
+        secret = re.search(r"/t/(itv_[\w-]+)", page).group(1)
+        import io
+        err = io.StringIO()
+        with mock.patch("sys.stderr", err):
+            link = self.req("/t/" + secret)[1]["Set-Cookie"].split(";")[0]
+        self.assertNotIn(secret, err.getvalue())
+        status, headers, page = self.req("/logout", cookie=link)
+        self.assertEqual(status, 200)
+        self.assertIn("Open your access link again", page)
+        self.assertIn("Max-Age=0", headers["Set-Cookie"])
 
     def test_guest_login(self):
         from viewer import auth as auth_mod

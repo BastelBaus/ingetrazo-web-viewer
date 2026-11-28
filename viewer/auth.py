@@ -15,6 +15,12 @@
   Authentik) has logged the user in and names them in a header; only
   requests from ``PROXY_TRUSTED_IPS`` are believed.
 
+Access links (``local`` and ``oidc``): an admin names one in the admin
+panel and hands out its link, ``/t/<token>``; opening it logs the browser in
+as that account (viewer only, its own folders). Scripts can send the token
+as ``Authorization: Bearer itv_…``. The session carries the token's id, so
+replacing or removing the link, switching it off or its expiry ends it.
+
 ``oidc`` and ``proxy`` add a user to the user list on first login, as
 ``user``; with an admin group set (``OIDC_ADMIN_GROUP`` /
 ``PROXY_ADMIN_GROUP``) the group decides who is ``admin``, else the admin
@@ -69,14 +75,15 @@ class User:
     name: str
     role: str = "user"            # "admin" or "user"
     source: str = "local"
+    key: str = ""                 # access links: the id of the token used
 
     @property
     def admin(self) -> bool:
         return self.role == "admin"
 
     @classmethod
-    def of(cls, acc: Account) -> "User":
-        return cls(acc.name, acc.role, acc.source)
+    def of(cls, acc: Account, key: str = "") -> "User":
+        return cls(acc.name, acc.role, acc.source, key)
 
 
 class Sessions:
@@ -91,8 +98,11 @@ class Sessions:
         return hmac.new(self.key, payload.encode(), hashlib.sha256).hexdigest()
 
     def issue(self, user: User) -> str:
-        payload = _b64(json.dumps({"u": user.name, "r": user.role, "s": user.source,
-                                   "e": int(time.time()) + self.max_age}).encode())
+        data = {"u": user.name, "r": user.role, "s": user.source,
+                "e": int(time.time()) + self.max_age}
+        if user.key:
+            data["k"] = user.key
+        payload = _b64(json.dumps(data).encode())
         return f"{payload}.{self._sig(payload)}"
 
     def read(self, value: str) -> User | None:
@@ -106,7 +116,7 @@ class Sessions:
         if not isinstance(data, dict) or int(data.get("e", 0)) < time.time():
             return None
         return User(str(data.get("u", "")), str(data.get("r", "user")),
-                    str(data.get("s", "local")))
+                    str(data.get("s", "local")), str(data.get("k", "")))
 
     def csrf(self, name: str) -> str:
         """The token a form of this user's pages carries (admin, account)."""
@@ -368,6 +378,18 @@ class Auth:
         acc = self.users.guest()
         return User.of(acc) if acc and acc.web else None
 
+    @property
+    def links(self) -> bool:
+        """Whether access links work: with the viewer's own sessions."""
+        return self.mode in ("local", "oidc")
+
+    def link_login(self, token: str) -> User | None:
+        """An access link's token: its account, if it may in now."""
+        if not self.links or self.users is None:
+            return None
+        found = self.users.by_link(token.strip())
+        return None if found is None else User.of(*found)
+
     def current(self, user: User) -> User | None:
         """A session's user as the list has them now: None when removed or
         switched off, with the role they have now."""
@@ -376,6 +398,11 @@ class Auth:
         acc = self.users.get(user.name)
         if acc and acc.source == "guest" and not self.guest:
             return None                       # guests no longer welcome
+        if (acc and acc.source == "link") or user.source == "link":
+            # The same link, still usable; a password session never becomes one.
+            ok = (self.links and user.source == "link" and user.key
+                  and self.users.link_usable(acc, user.key))
+            return User.of(acc, user.key) if ok else None
         return User.of(acc) if acc and acc.active and acc.web else None
 
     def settings(self, user: User | None) -> dict:
@@ -386,7 +413,7 @@ class Auth:
     def disabled(self, name: str) -> bool:
         """A known user who may not in: switched off, or no web viewer."""
         acc = self.users.get(name) if self.users is not None and name else None
-        return bool(acc and (not acc.active or not acc.web))
+        return bool(acc and (not acc.active or not acc.web or acc.expired))
 
     def _seen(self, name: str, groups: list[str], source: str) -> User | None:
         group = self.admin_group

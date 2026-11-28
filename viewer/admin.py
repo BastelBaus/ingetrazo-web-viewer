@@ -6,7 +6,9 @@ session's CSRF token.
 Admins add local users (``VIEWER_AUTH_MODE=local``), set a user's role
 (unless the provider's admin group decides it), switch users off and on,
 set a local user's password, give them folders (``/admin/shares``, see
-mcp_http/shares.py), and remove users. The list always keeps one
+mcp_http/shares.py), and remove users. They also hand out access links:
+a named account for the web viewer only, opened with a link
+(``/t/<token>``), with its own folders and an optional last day. The list always keeps one
 active admin, and an admin cannot switch themself off or remove themself.
 """
 from __future__ import annotations
@@ -79,6 +81,18 @@ def _messages(note: str, error: str) -> str:
     if note.startswith("TOKEN:"):              # a new token: shown once, easy to copy
         return ('<div class="note">Your new token – copy it now, it is shown only once:'
                 f'<div class="token">{escape(note[6:])}</div></div>')
+    if note.startswith("LINK:"):               # a new access link: shown once
+        name, _, token = note[5:].partition(":")
+        path = "/t/" + token
+        return ('<div class="note">The access link for <strong>' + escape(name)
+                + '</strong> – copy it now, it is shown only once:'
+                f'<div class="token" id="newlink">{escape(path)}</div>'
+                '<script>(function(){const e=document.getElementById("newlink");'
+                'e.textContent=location.origin+e.textContent;})()</script>'
+                '<p class="muted">Whoever has it sees what its folders allow, until you switch '
+                'it off, replace or remove it. Scripts send the part after <code>/t/</code> as '
+                '<code>Authorization: Bearer …</code>. '
+                f'<a href="/admin/shares?name={quote(name)}">Choose its folders</a></p></div>')
     return ((f'<div class="note">{escape(note)}</div>' if note else "")
             + (f'<div class="err">{escape(error)}</div>' if error else ""))
 
@@ -96,7 +110,11 @@ def page(auth, user, note: str = "", error: str = "", title: str = "") -> bytes:
     """The user list, for an admin."""
     by_group = bool(auth.admin_group)
     rows = []
+    links = []
     for acc in auth.users.all():
+        if acc.source == "link":
+            links.append(acc)
+            continue
         me = acc.name.lower() == user.name.lower()
         acts = []
         if acc.source == "guest":
@@ -179,8 +197,62 @@ def page(auth, user, note: str = "", error: str = "", title: str = "") -> bytes:
     body = (_messages(note, error) + _nav("users")
             + '<h2>Users</h2><table><thead><tr><th>User</th><th>Role</th><th>Login</th>'
             '<th>Last login</th><th></th></tr></thead><tbody>' + "".join(rows)
-            + "</tbody></table>" + add + site_form)
+            + "</tbody></table>" + add + _links(auth, user, links) + site_form)
     return _wrap("Users", body, user, title)
+
+
+def _date(value: str | None, empty: str = "–") -> str:
+    return escape((value or empty)[:16].replace("T", " "))
+
+
+def _links(auth, user, links: list) -> str:
+    """Access links: named accounts for the web viewer only, opened with a
+    link; their folders, last day, switch, new link, remove."""
+    if not getattr(auth, "links", False):
+        return ""
+    rows = []
+    for acc in links:
+        info = auth.users.link_info(acc.name) or {}
+        n = ("default" if acc.shares is None else
+             f"{sum(1 for x in acc.shares if x['access'] != 'none')} shared")
+        state = ("" if acc.active else ' <span class="tag">off</span>') + (
+            ' <span class="tag">expired</span>' if acc.expired else "")
+        acts = [
+            f'<a class="btn" href="/admin/shares?name={quote(acc.name)}">'
+            f'Folders <span class="muted">({n})</span></a>',
+            _form(auth, user, "link_expires", acc.name,
+                  f'<input type="date" name="expires" value="{escape(acc.expires or "")}" '
+                  'aria-label="Last day" title="The last day the link works; empty: no end">'
+                  '<button title="Save the last day">Set</button>'),
+            _form(auth, user, "active", acc.name,
+                  f'<input type="hidden" name="on" value="{0 if acc.active else 1}">'
+                  f'<button>{"Switch off" if acc.active else "Switch on"}</button>'),
+            _form(auth, user, "link_new", acc.name,
+                  '<button title="A new link; the old one and its sessions stop working">'
+                  'New link</button>',
+                  confirm=f"New link for {acc.name}? The old link stops working."),
+            _form(auth, user, "delete", acc.name, '<button class="danger">Remove</button>',
+                  confirm=f"Remove the access link {acc.name}?"),
+        ]
+        rows.append(
+            f'<tr class="{"" if acc.active and not acc.expired else "off"}"><td>'
+            f'<strong>{escape(acc.name)}</strong>{state}</td>'
+            f'<td class="muted">{_date(acc.expires, "no end")}</td>'
+            f'<td class="muted">{_date(info.get("last_used"), "never")}</td>'
+            f'<td class="acts"><div>{"".join(acts)}</div></td></tr>')
+    table = ('<table><thead><tr><th>Name</th><th>Last day</th><th>Last used</th><th></th>'
+             '</tr></thead><tbody>' + "".join(rows) + '</tbody></table>' if rows else "")
+    return ('<h2>Access links</h2><p class="muted">A link that opens the viewer without a '
+            'password, with the folders you give it (read only; no MCP). New links see '
+            'nothing until you choose their folders.</p>' + table
+            + '<form class="add" method="post" action="/admin" style="margin-top:12px">'
+            f'<input type="hidden" name="csrf" value="{auth.sessions.csrf(user.name)}">'
+            '<input type="hidden" name="action" value="link_create">'
+            '<input name="name" placeholder="Name, e.g. Carpenter Meier" autocomplete="off" '
+            'required aria-label="Name of the link">'
+            '<input type="date" name="expires" aria-label="Last day (optional)" '
+            'title="The last day the link works (optional)">'
+            '<button class="primary">New access link</button></form>')
 
 
 def _nav(here: str) -> str:
@@ -331,6 +403,17 @@ def act(auth, user, form: dict) -> tuple[str, str]:
             if drop:
                 return f"Pattern {', '.join(sorted(drop))} removed; folders of {name} saved.", ""
             return f"Folders of {name} saved.", ""
+        if action == "link_create":
+            if not getattr(auth, "links", False):
+                raise UserError("access links need the local or oidc login")
+            acc, token = users.create_link(name, get("expires"))
+            return f"LINK:{acc.name}:{token}", ""
+        if action == "link_new":
+            return f"LINK:{name}:{users.new_link(name)}", ""
+        if action == "link_expires":
+            day = users.set_expires(name, get("expires"))
+            return (f"The link {name} works through {day}." if day
+                    else f"The link {name} has no end.", "")
         if action == "delete":
             if me:
                 raise UserError("you cannot remove yourself")
@@ -557,6 +640,10 @@ def account_page(auth, user, note: str = "", error: str = "", title: str = "") -
     if acc and acc.source == "guest":
         info = ('<p>Logged in as <strong>guest</strong>. Every guest shares these '
                 'settings.</p>')
+    elif acc and acc.source == "link":
+        info = (f'<p>Logged in with the access link <strong>{escape(acc.name)}</strong>'
+                + (f', valid through {escape(acc.expires)}' if acc.expires else "")
+                + '. Everyone with this link shares these settings.</p>')
     else:
         info = (f'<p>Logged in as <strong>{escape(user.name)}</strong>, {escape(user.role)}'
                 f'{", through " + escape(acc.source) if acc and acc.source != "local" else ""}.</p>')
