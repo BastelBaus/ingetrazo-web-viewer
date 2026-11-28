@@ -34,7 +34,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
 from mcp_http import folders, shares
-from mcp_http.common import log
+from mcp_http.common import log, must_close
 from mcp_http.users import UserError
 
 from . import admin, audit, avatar, site, version
@@ -715,10 +715,15 @@ def pdf_page(slug: str, user: User | None = None) -> tuple[bytes | None, str]:
 COOKIE = "itz_viewer"
 
 
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+
+
 def _safe_next(value: str) -> str:
-    """Only a path on this server (no //host, no /\\host, no scheme)."""
+    """Only a path on this server (no //host, no /\\host, no scheme). No
+    control characters: CR/LF would end the Location header, and browsers
+    drop tabs and newlines, so "/\\t/host" would become "//host"."""
     return (value if value.startswith("/") and not value.startswith(("//", "/\\"))
-            else "/")
+            and not _CONTROL.search(value) else "/")
 
 
 LOGIN_CSS = """
@@ -832,6 +837,19 @@ class Handler(BaseHTTPRequestHandler):
             fields.setdefault("user", who.name)
             fields.setdefault("source", who.source)
         audit.record(kind, ip=ip, fwd=fwd, **fields)
+
+    def send_response(self, code, message=None):
+        super().send_response(code, message)
+        if must_close(self, code):
+            self.send_header("Connection", "close")
+            self.close_connection = True
+
+    def send_header(self, keyword, value):
+        """A header never carries a line break: input that reaches one (a
+        redirect target) cannot start a header of its own."""
+        if "\r" in str(value) or "\n" in str(value):
+            raise ValueError(f"line break in the {keyword} header")
+        super().send_header(keyword, value)
 
     def _send(self, status: int, body: bytes, ctype: str, extra: dict | None = None):
         self.send_response(status)
@@ -988,8 +1006,8 @@ class Handler(BaseHTTPRequestHandler):
             if user is None:
                 return None
             form = self._form()
-            if not hmac.compare_digest((form.get("csrf") or [""])[0],
-                                       auth.sessions.csrf(user.name)):
+            if not hmac.compare_digest((form.get("csrf") or [""])[0].encode(),
+                                       auth.sessions.csrf(user.name).encode()):
                 return self._html(403, message_page("The form expired; open it again.",
                                                     path, "Back"))
             if path == "/admin/renders":
@@ -1035,8 +1053,8 @@ class Handler(BaseHTTPRequestHandler):
         if user is None:
             return None
         form = self._form()
-        if not hmac.compare_digest((form.get("csrf") or [""])[0],
-                                   auth.sessions.csrf(user.name)):
+        if not hmac.compare_digest((form.get("csrf") or [""])[0].encode(),
+                                   auth.sessions.csrf(user.name).encode()):
             return self._send(403, b'{"error": "csrf"}', "application/json")
         changes = {k: admin.setting_value(k, v[0]) for k, v in form.items() if k != "csrf"}
         try:

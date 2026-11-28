@@ -26,6 +26,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import threading
 import time
@@ -189,13 +190,21 @@ class OAuthServer:
     def redirect_allowed(self, uri: str) -> bool:
         """``uri`` matches the allow list: same scheme and host, the path
         under the allowed one; an allowed loopback host without a port
-        takes any port. No user info, no fragment."""
+        takes any port. No user info, no fragment. No control characters,
+        spaces or backslashes (urlsplit drops tabs and line breaks, but the
+        URI goes into a Location header as it is), and no ``.``/``..``
+        segments (they would leave the allowed path)."""
+        if not isinstance(uri, str) or re.search(r"[\x00-\x20\x7f\\]", uri):
+            return False
         try:
             u = urlsplit(uri)
             port = u.port
         except ValueError:
             return False
         if u.username or u.password or u.fragment or not u.hostname:
+            return False
+        if any(seg in (".", "..") or seg.lower() in ("%2e", "%2e%2e", ".%2e", "%2e.")
+               for seg in u.path.split("/")):
             return False
         for a in self.redirects:
             if u.scheme != a.scheme or u.hostname != a.hostname:
@@ -361,7 +370,8 @@ class OAuthServer:
             if form.get("redirect_uri", code["redirect_uri"]) != code["redirect_uri"]:
                 raise OAuthError("invalid_grant", "redirect_uri does not match")
             verifier = form.get("code_verifier", "")
-            if not verifier or not hmac.compare_digest(_s256(verifier), code["code_challenge"]):
+            if not verifier or not hmac.compare_digest(_s256(verifier).encode(),
+                                                       str(code["code_challenge"]).encode()):
                 raise OAuthError("invalid_grant", "PKCE verification failed")
             return self._issue(cid, code.get("user", ""))
         if grant == "refresh_token":

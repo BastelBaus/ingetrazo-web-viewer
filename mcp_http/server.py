@@ -38,7 +38,7 @@ from urllib.parse import urlsplit
 from pathlib import Path
 
 from . import folders, shares
-from .common import DATA_DIR, log
+from .common import DATA_DIR, log, must_close
 from .auth import FULL, Auth, Caller
 from .remote import RemoteApp, mcp_engine_url
 
@@ -217,6 +217,19 @@ class Handler(BaseHTTPRequestHandler):
         if self.path != "/healthz":
             sys.stderr.write("[http] %s %s\n" % (self.address_string(),
                                                  fmt % args))
+
+    def send_response(self, code, message=None):
+        super().send_response(code, message)
+        if must_close(self, code):
+            self.send_header("Connection", "close")
+            self.close_connection = True
+
+    def send_header(self, keyword, value):
+        """A header never carries a line break: input that reaches one (a
+        redirect target) cannot start a header of its own."""
+        if "\r" in str(value) or "\n" in str(value):
+            raise ValueError(f"line break in the {keyword} header")
+        super().send_header(keyword, value)
 
     def _send(self, status: int, body: bytes = b"",
               ctype: str = "application/json", headers: dict | None = None):

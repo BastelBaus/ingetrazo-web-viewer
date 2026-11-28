@@ -107,7 +107,7 @@ class Sessions:
 
     def read(self, value: str) -> User | None:
         payload, _, sig = value.partition(".")
-        if not payload or not hmac.compare_digest(sig, self._sig(payload)):
+        if not payload or not hmac.compare_digest(sig.encode(), self._sig(payload).encode()):
             return None
         try:
             data = json.loads(_unb64(payload))
@@ -246,7 +246,7 @@ class OIDC:
             raise ValueError("ID token for another client")
         if int(claims.get("exp", 0)) < time.time() - 60:
             raise ValueError("ID token expired")
-        if not hmac.compare_digest(str(claims.get("nonce", "")), nonce):
+        if not hmac.compare_digest(str(claims.get("nonce", "")).encode(), nonce.encode()):
             raise ValueError("ID token nonce mismatch")
         return claims
 
