@@ -1,0 +1,154 @@
+# The full test: the long run before a release. It runs on PRs into main
+# (release and hotfix PRs), on any PR labelled "full-test", and by hand.
+# Every PR gets the quick checks of ci.yml ("smoke") instead.
+#
+#   - unit tests including the slow ones (FULL_TEST=1)
+#   - the image built natively for amd64 and arm64, with the smoke test and
+#     tests/full.sh on both: compose.yaml as shipped, everything of an
+#     example rendered and served, MCP through the gateway, the stack's
+#     isolation (internal engine network, separate secrets, no root,
+#     read-only data) and security checks against the running servers
+#   - a scan of the image for known vulnerabilities (report only)
+#
+# The engine: ENGINE_IMAGE (repo variable) or :dev, as in ci.yml. :dev is
+# built for amd64 only; on arm64 the newest image that has arm64 and starts
+# is used (:rc, else :latest), else one built from ingetrazo-docker
+# (ENGINE_REF, default dev). The summary names it.
+#
+# "full test" is the check to require on main: it is green only when both
+# architectures passed.
+name: Full test
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Another label on the PR must not cancel a running full test.
+  group: >-
+    full-${{ github.ref }}-${{ github.event_name }}-${{
+    github.event.action == 'labeled' && github.event.label.name || 'code' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  run:
+    name: full test (${{ matrix.arch }})
+    if: >-
+      github.event_name != 'pull_request'
+      || (github.event.action != 'labeled' && (github.base_ref == 'main'
+          || contains(github.event.pull_request.labels.*.name, 'full-test')))
+      || (github.event.action == 'labeled' && github.event.label.name == 'full-test')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 150
+    env:
+      ENGINE_IMAGE: ${{ vars.ENGINE_IMAGE || 'ghcr.io/bastelbaus/ingetrazo:dev' }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Unit tests, the slow ones too
+        env:
+          FULL_TEST: "1"
+        run: python3 -m unittest discover -s tests -p "test_*.py" -v
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build image (${{ matrix.arch }})
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          tags: ingetrazo-web-viewer:full
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,scope=${{ matrix.arch }},mode=max
+
+      # An engine image that starts on this architecture: ENGINE_IMAGE, else
+      # :rc, else :latest. Older arm64 images have a PySide6 IngeTrazo cannot
+      # run with (ingelibre/ingetrazo#1728); when none works, the engine is
+      # built from ingetrazo-docker (ENGINE_REF, default dev).
+      - name: The engine for ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          works() {
+            docker pull -q --platform "linux/${{ matrix.arch }}" "$1" >/dev/null 2>&1 \
+              && docker run --rm --entrypoint python "$1" -c \
+                   "from PySide6.QtGui import QVector3D; QVector3D(QVector3D(1, 2, 3))" >/dev/null 2>&1
+          }
+          base="${ENGINE_IMAGE%:*}"
+          image=""
+          for candidate in "$ENGINE_IMAGE" "$base:rc" "$base:latest"; do
+            if works "$candidate"; then image="$candidate"; break; fi
+            echo "::notice::$candidate: no ${{ matrix.arch }} image, or IngeTrazo cannot start in it"
+          done
+          if [ -z "$image" ]; then
+            ref="${ENGINE_REF:-dev}"
+            echo "::notice::building the engine from BastelBaus/ingetrazo-docker@$ref"
+            git clone -q --depth 1 --branch "$ref" https://github.com/BastelBaus/ingetrazo-docker /tmp/engine
+            docker build -q -t ingetrazo-engine:full /tmp/engine >/dev/null
+            image=ingetrazo-engine:full
+            works "$image" || docker run --rm --entrypoint python "$image" -c \
+              "from PySide6.QtGui import QVector3D; QVector3D(QVector3D(1, 2, 3))"
+          fi
+          echo "ENGINE_IMAGE=$image" >> "$GITHUB_ENV"
+          echo "### Engine (${{ matrix.arch }}): \`$image\` ($(docker run --rm --entrypoint cat "$image" /opt/ingetrazo/BUILD_REF))" >> "$GITHUB_STEP_SUMMARY"
+        env:
+          ENGINE_REF: ${{ vars.ENGINE_REF }}
+
+      - name: Smoke test
+        env:
+          IMAGE: ingetrazo-web-viewer:full
+        run: tests/smoke.sh
+
+      - name: Full test (compose stack)
+        env:
+          IMAGE: ingetrazo-web-viewer:full
+        run: tests/full.sh
+
+      - name: Vulnerability scan (report only)
+        if: matrix.arch == 'amd64' && !cancelled()
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:latest image --quiet --no-progress --exit-code 0 \
+            --severity HIGH,CRITICAL --ignore-unfixed --format table \
+            ingetrazo-web-viewer:full | tee trivy.txt
+          { echo "### Vulnerability scan (HIGH, CRITICAL, fixable)"; echo; echo '```';
+            cat trivy.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+  # The one check to require: green when every architecture passed. When
+  # some other label is added it gets another name, so its (empty) result
+  # never stands in for a real one.
+  result:
+    name: >-
+      ${{ (github.event.action == 'labeled' && github.event.label.name != 'full-test')
+      && 'full test (not run)' || 'full test' }}
+    needs: run
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Every architecture passed
+        env:
+          RESULT: ${{ needs.run.result }}
+          BASE: ${{ github.base_ref }}
+          ACTION: ${{ github.event.action }}
+          LABEL: ${{ github.event.label.name }}
+        run: |
+          echo "full test: $RESULT"
+          [ "$RESULT" = success ] && exit 0
+          # Another label was added: nothing ran, nothing to report.
+          [ "$ACTION" = labeled ] && [ "$LABEL" != full-test ] && exit 0
+          # Skipped: a PR into dev without the label (nothing to require there).
+          [ "$RESULT" = skipped ] && [ "$BASE" != main ]

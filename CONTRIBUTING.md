@@ -7,9 +7,12 @@ Thanks for helping! Issues and pull requests are welcome. In short:
   `docs: …`, `ci: …`, `chore: …`; `feat!: …` marks a breaking change. The title ends up in the release notes.
 - Sign off every commit (`git commit -s`, see [DCO](#developer-certificate-of-origin-dco) below).
 - The required checks must pass: *DCO* and *smoke* (shellcheck, unit tests, image build, smoke test);
-  PRs into `main` also need a code owner's review (and, later, the full test). See
+  PRs into `main` also need a code owner's review and the *full test*. See
   [Branch protection](docs/RELEASING.md#branch-protection). Run locally:
-  `python3 -m unittest discover -s tests -p "test_*.py"` and `IMAGE=… tests/smoke.sh`.
+  `python3 -m unittest discover -s tests -p "test_*.py"` and `IMAGE=… tests/smoke.sh`; the full test:
+  `FULL_TEST=1 python3 -m unittest discover -s tests -p "test_*.py"` and `IMAGE=… ENGINE_IMAGE=… tests/full.sh`.
+  Quick checks go into the unit tests or `tests/smoke.sh` (every PR); slow ones into `tests/full.sh` or
+  behind `FULL_TEST` (PRs into `main`). Security fixes come with a test in `tests/test_security.py`.
 - **Auto-merge into `dev`:** a PR into `dev` from this repository merges by itself once *smoke*, *DCO* and
   *title* are green and it has no conflicts (`.github/workflows/automerge.yml`; it then starts *Publish* on
   `dev`). Not for drafts, forks or PRs labelled `no-automerge`; a conflict gets a comment instead.

@@ -88,39 +88,125 @@ class User:
 
 class Sessions:
     """Signed session cookies: ``<payload>.<hmac>``. The key is new on every
-    start, so a restart logs everyone out."""
+    start, so a restart logs everyone out. Each session has an id; logging
+    out revokes it here, so a copy of the cookie ends with it (kept in
+    memory until the session would have expired: the next start makes a
+    new key anyway)."""
 
     def __init__(self, days: int) -> None:
         self.key = secrets.token_bytes(32)
         self.max_age = days * 86400
+        self._revoked: dict[str, float] = {}
+        self._lock = threading.Lock()
 
     def _sig(self, payload: str) -> str:
         return hmac.new(self.key, payload.encode(), hashlib.sha256).hexdigest()
 
     def issue(self, user: User) -> str:
         data = {"u": user.name, "r": user.role, "s": user.source,
-                "e": int(time.time()) + self.max_age}
+                "e": int(time.time()) + self.max_age, "i": secrets.token_hex(8)}
         if user.key:
             data["k"] = user.key
         payload = _b64(json.dumps(data).encode())
         return f"{payload}.{self._sig(payload)}"
 
-    def read(self, value: str) -> User | None:
+    def _data(self, value: str) -> dict | None:
+        """The signed, unexpired, not revoked payload of a cookie value."""
         payload, _, sig = value.partition(".")
-        if not payload or not hmac.compare_digest(sig, self._sig(payload)):
+        if not payload or not hmac.compare_digest(sig.encode(), self._sig(payload).encode()):
             return None
         try:
             data = json.loads(_unb64(payload))
         except ValueError:
             return None
-        if not isinstance(data, dict) or int(data.get("e", 0)) < time.time():
+        if not isinstance(data, dict):
+            return None
+        try:
+            if int(data.get("e", 0)) < time.time():
+                return None
+        except (TypeError, ValueError):
+            return None
+        with self._lock:
+            if str(data.get("i", "")) in self._revoked:
+                return None
+        return data
+
+    def read(self, value: str) -> User | None:
+        data = self._data(value)
+        if data is None:
             return None
         return User(str(data.get("u", "")), str(data.get("r", "user")),
                     str(data.get("s", "local")), str(data.get("k", "")))
 
+    def revoke(self, value: str) -> bool:
+        """Logout: this session ends, wherever a copy of its cookie is."""
+        data = self._data(value)
+        if data is None or not data.get("i"):
+            return False
+        now = time.time()
+        with self._lock:
+            for k in [k for k, exp in self._revoked.items() if exp < now]:
+                del self._revoked[k]
+            self._revoked[str(data["i"])] = float(data["e"])
+        return True
+
     def csrf(self, name: str) -> str:
         """The token a form of this user's pages carries (admin, account)."""
         return hmac.new(self.key, b"csrf:" + name.encode(), hashlib.sha256).hexdigest()[:32]
+
+
+class Throttle:
+    """Wrong passwords and access links per client address
+    (``VIEWER_LOGIN_LIMIT`` in ``VIEWER_LOGIN_WINDOW`` seconds; default 10
+    in 15 minutes, 0: no limit). Past the limit that address may not try,
+    not even with the right password, until the oldest failure is out of
+    the window. The address is the one the audit log names: behind a proxy
+    set ``VIEWER_TRUSTED_PROXIES``, else every user shares the proxy's."""
+
+    MAX_KEYS = 10000
+
+    def __init__(self) -> None:
+        try:
+            self.limit = max(0, int(_env("VIEWER_LOGIN_LIMIT") or 10))
+            self.window = max(1, int(_env("VIEWER_LOGIN_WINDOW") or 900))
+        except ValueError:
+            raise SystemExit("VIEWER_LOGIN_LIMIT and VIEWER_LOGIN_WINDOW must be "
+                             "whole numbers") from None
+        self._fails: dict[str, list[float]] = {}
+        self._lock = threading.Lock()
+
+    def _recent(self, key: str, now: float) -> list[float]:
+        fails = [t for t in self._fails.get(key, []) if t > now - self.window]
+        if fails:
+            self._fails[key] = fails
+        else:
+            self._fails.pop(key, None)
+        return fails
+
+    def wait(self, key: str) -> int:
+        """Seconds until ``key`` may try again; 0: now."""
+        if not self.limit:
+            return 0
+        now = time.time()
+        with self._lock:
+            fails = self._recent(key, now)
+            if len(fails) < self.limit:
+                return 0
+            return max(1, int(fails[-self.limit] + self.window - now) + 1)
+
+    def failed(self, key: str) -> None:
+        if not self.limit:
+            return
+        now = time.time()
+        with self._lock:
+            if len(self._fails) >= self.MAX_KEYS and key not in self._fails:
+                for k in list(self._fails):
+                    self._recent(k, now)
+                if len(self._fails) >= self.MAX_KEYS:   # still full: forget the oldest
+                    oldest = min(self._fails, key=lambda k: self._fails[k][-1])
+                    del self._fails[oldest]
+            self._fails.setdefault(key, []).append(now)
+            self._fails[key] = self._fails[key][-self.limit:]
 
 
 class OIDC:
@@ -246,7 +332,7 @@ class OIDC:
             raise ValueError("ID token for another client")
         if int(claims.get("exp", 0)) < time.time() - 60:
             raise ValueError("ID token expired")
-        if not hmac.compare_digest(str(claims.get("nonce", "")), nonce):
+        if not hmac.compare_digest(str(claims.get("nonce", "")).encode(), nonce.encode()):
             raise ValueError("ID token nonce mismatch")
         return claims
 
@@ -312,6 +398,7 @@ class Auth:
             raise SystemExit(f"VIEWER_AUTH_MODE must be one of {', '.join(MODES)}, "
                              f"not {raw!r}")
         self.sessions = Sessions(int(_env("VIEWER_SESSION_DAYS") or 30))
+        self.throttle = Throttle()
         # ADMIN_USER / ADMIN_PASSWORD; the older VIEWER_USER / VIEWER_PASSWORD
         # still work, so an update locks nobody out.
         self.user_name = _env("ADMIN_USER") or _env("VIEWER_USER") or "admin"

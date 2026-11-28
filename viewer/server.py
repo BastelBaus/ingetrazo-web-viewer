@@ -34,7 +34,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
 from mcp_http import folders, shares
-from mcp_http.common import log
+from mcp_http.common import content_length, log, must_close
 from mcp_http.users import UserError
 
 from . import admin, audit, avatar, site, version
@@ -715,10 +715,41 @@ def pdf_page(slug: str, user: User | None = None) -> tuple[bytes | None, str]:
 COOKIE = "itz_viewer"
 
 
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+
+
 def _safe_next(value: str) -> str:
-    """Only a path on this server (no //host, no /\\host, no scheme)."""
+    """Only a path on this server (no //host, no /\\host, no scheme). No
+    control characters: CR/LF would end the Location header, and browsers
+    drop tabs and newlines, so "/\\t/host" would become "//host"."""
     return (value if value.startswith("/") and not value.startswith(("//", "/\\"))
-            else "/")
+            and not _CONTROL.search(value) else "/")
+
+
+def _minutes(seconds: int) -> str:
+    m = max(1, round(seconds / 60))
+    return f"{m} minute{'s' if m != 1 else ''}"
+
+
+def security_headers() -> dict:
+    """Headers on every reply: no MIME sniffing, no referrer to other
+    sites, and no framing by other sites (clickjacking of the admin
+    panel). ``VIEWER_FRAME_ANCESTORS``: who may frame the viewer – unset:
+    only the viewer itself; ``none``: nobody; ``*``: anyone; else origins
+    (``https://ha.example.org https://wiki.example.org``)."""
+    out = {"X-Content-Type-Options": "nosniff", "Referrer-Policy": "same-origin"}
+    raw = os.environ.get("VIEWER_FRAME_ANCESTORS", "").strip()
+    if not raw:
+        out.update({"X-Frame-Options": "SAMEORIGIN",
+                    "Content-Security-Policy": "frame-ancestors 'self'"})
+    elif raw.lower() == "none":
+        out.update({"X-Frame-Options": "DENY",
+                    "Content-Security-Policy": "frame-ancestors 'none'"})
+    elif raw != "*":
+        origins = " ".join(o for o in re.split(r"[\s,;]+", raw) if re.fullmatch(
+            r"https?://[A-Za-z0-9.-]+(:\d+)?|https?://\*\.[A-Za-z0-9.-]+", o))
+        out["Content-Security-Policy"] = f"frame-ancestors 'self' {origins}".strip()
+    return out
 
 
 LOGIN_CSS = """
@@ -833,11 +864,24 @@ class Handler(BaseHTTPRequestHandler):
             fields.setdefault("source", who.source)
         audit.record(kind, ip=ip, fwd=fwd, **fields)
 
+    def send_response(self, code, message=None):
+        super().send_response(code, message)
+        if must_close(self, code):
+            self.send_header("Connection", "close")
+            self.close_connection = True
+
+    def send_header(self, keyword, value):
+        """A header never carries a line break: input that reaches one (a
+        redirect target) cannot start a header of its own."""
+        if "\r" in str(value) or "\n" in str(value):
+            raise ValueError(f"line break in the {keyword} header")
+        super().send_header(keyword, value)
+
     def _send(self, status: int, body: bytes, ctype: str, extra: dict | None = None):
         self.send_response(status)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
-        for k, v in (extra or {}).items():
+        for k, v in {**security_headers(), **(extra or {})}.items():
             self.send_header(k, v)
         self.end_headers()
         if self.command != "HEAD":
@@ -848,31 +892,52 @@ class Handler(BaseHTTPRequestHandler):
     # session cookie: embedded browsers (VS Code's, many WebViews) never
     # show the Basic-auth dialog and only print the 401. Scripts and curl
     # use Basic auth (local). A proxy (proxy) names the user on every request.
-    def _cookie_user(self) -> User | None:
+    def _cookie_value(self) -> str | None:
         jar = SimpleCookie()
         try:
             jar.load(self.headers.get("Cookie", ""))
         except CookieError:
             return None
         morsel = jar.get(COOKIE)
-        return None if morsel is None else auth.sessions.read(morsel.value)
+        return None if morsel is None else morsel.value
+
+    def _cookie_user(self) -> User | None:
+        value = self._cookie_value()
+        return None if value is None else auth.sessions.read(value)
+
+    def _throttled(self) -> int:
+        """Seconds this client must wait after too many wrong passwords or
+        access links (viewer/auth.py Throttle); 0: it may try."""
+        throttle = getattr(auth, "throttle", None)
+        return throttle.wait(self._client()[0]) if throttle else 0
+
+    def _failed(self) -> None:
+        throttle = getattr(auth, "throttle", None)
+        if throttle:
+            throttle.failed(self._client()[0])
 
     def _basic_user(self) -> User | None:
         value = self.headers.get("Authorization", "")
-        if not value.startswith("Basic "):
+        if not value.startswith("Basic ") or self._throttled():
             return None
         try:
             user, _, pw = base64.b64decode(value[6:]).decode().partition(":")
         except ValueError:
             return None
-        return auth.login(user, pw)
+        found = auth.login(user, pw)
+        if found is None and auth.users.authenticate(user, pw) is None:
+            self._failed()
+        return found
 
     def _bearer_user(self) -> User | None:
         """An access link's token as ``Authorization: Bearer itv_…`` (scripts)."""
         value = self.headers.get("Authorization", "")
-        if not value.startswith("Bearer "):
+        if not value.startswith("Bearer ") or self._throttled():
             return None
-        return auth.link_login(value[7:])
+        found = auth.link_login(value[7:])
+        if found is None:
+            self._failed()
+        return found
 
     def _user(self) -> User | None:
         if auth.mode == "none":
@@ -957,12 +1022,19 @@ class Handler(BaseHTTPRequestHandler):
     def _login_page(self, status: int = 200, error: str = "", nxt: str = "/"):
         self._html(status, login_page(error, nxt))
 
+    @staticmethod
+    def _login_page_body(error: str, nxt: str) -> bytes:
+        return login_page(error, nxt)
+
+    def _too_many(self, wait: int, page: bytes) -> None:
+        self._html(429, page, {"Retry-After": str(wait)})
+
     def _session_cookie(self, user: User) -> str:
         return (f"{COOKIE}={auth.sessions.issue(user)}; Path=/; HttpOnly; SameSite=Lax; "
                 f"Max-Age={auth.sessions.max_age}" + ("; Secure" if self._secure() else ""))
 
     def _form(self) -> dict:
-        length = min(int(self.headers.get("Content-Length") or 0), 16384)
+        length = min(content_length(self.headers) or 0, 16384)
         return parse_qs(self.rfile.read(length).decode("utf-8", "replace"),
                         keep_blank_values=True)
 
@@ -988,8 +1060,8 @@ class Handler(BaseHTTPRequestHandler):
             if user is None:
                 return None
             form = self._form()
-            if not hmac.compare_digest((form.get("csrf") or [""])[0],
-                                       auth.sessions.csrf(user.name)):
+            if not hmac.compare_digest((form.get("csrf") or [""])[0].encode(),
+                                       auth.sessions.csrf(user.name).encode()):
                 return self._html(403, message_page("The form expired; open it again.",
                                                     path, "Back"))
             if path == "/admin/renders":
@@ -1038,8 +1110,8 @@ class Handler(BaseHTTPRequestHandler):
         if user is None:
             return None
         form = self._form()
-        if not hmac.compare_digest((form.get("csrf") or [""])[0],
-                                   auth.sessions.csrf(user.name)):
+        if not hmac.compare_digest((form.get("csrf") or [""])[0].encode(),
+                                   auth.sessions.csrf(user.name).encode()):
             return self._send(403, b'{"error": "csrf"}', "application/json")
         changes = {k: admin.setting_value(k, v[0]) for k, v in form.items() if k != "csrf"}
         try:
@@ -1054,6 +1126,12 @@ class Handler(BaseHTTPRequestHandler):
         name = (form.get("user") or [""])[0].strip()
         pw = (form.get("password") or [""])[0]
         nxt = _safe_next((form.get("next") or ["/"])[0])
+        wait = self._throttled()
+        if wait:
+            self._audit("login", user=name[:64], source="local", status=429,
+                        detail="too many wrong passwords from this address")
+            return self._too_many(wait, self._login_page_body(
+                f"Too many wrong passwords. Try again in {_minutes(wait)}.", nxt))
         user = auth.login(name, pw)
         if user is None and auth.users.authenticate(name, pw) is not None:
             self._audit("login", user=name[:64], source="local", status=403,
@@ -1066,6 +1144,7 @@ class Handler(BaseHTTPRequestHandler):
                 "Location": nxt, "Set-Cookie": self._session_cookie(user)})
         self._audit("login", user=name[:64], source="local", status=401,
                     detail="wrong user name or password")
+        self._failed()
         time.sleep(0.7)                          # slows down guessing
         return self._login_page(401, "Wrong user name or password.", nxt)
 
@@ -1091,6 +1170,7 @@ class Handler(BaseHTTPRequestHandler):
             link = self._cookie_user()
             if link is not None:
                 self._audit("logout", user=link)
+                auth.sessions.revoke(self._cookie_value() or "")   # copies end too
             if link is not None and link.source == "link":
                 self._html(200, message_page(
                     "You are logged out. Open your access link again to come back."),
@@ -1151,10 +1231,17 @@ class Handler(BaseHTTPRequestHandler):
         if not getattr(auth, "links", False):
             self._send(404, b"not found\n", "text/plain")
             return True
+        wait = self._throttled()
+        if wait:
+            self._audit("login", source="link", status=429,
+                        detail="too many wrong access links from this address")
+            return self._too_many(wait, message_page(
+                f"Too many wrong access links. Try again in {_minutes(wait)}.")) or True
         user = auth.link_login(token)
         if user is None:
             self._audit("login", source="link", status=403,
                         detail="access link not valid (wrong, switched off or expired)")
+            self._failed()
             time.sleep(0.7)                      # slows down guessing
             self._html(403, message_page(
                 "This access link does not work (any more). Ask whoever gave it to you "

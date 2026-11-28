@@ -26,6 +26,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import threading
 import time
@@ -33,7 +34,7 @@ from html import escape
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlsplit
 
-from .common import log
+from .common import content_length, log
 
 STATE_DIR = Path(os.environ.get("INGETRAZO_STATE", "/state"))
 #: claude.ai's and claude.com's connector callbacks, and any port on this
@@ -189,13 +190,21 @@ class OAuthServer:
     def redirect_allowed(self, uri: str) -> bool:
         """``uri`` matches the allow list: same scheme and host, the path
         under the allowed one; an allowed loopback host without a port
-        takes any port. No user info, no fragment."""
+        takes any port. No user info, no fragment. No control characters,
+        spaces or backslashes (urlsplit drops tabs and line breaks, but the
+        URI goes into a Location header as it is), and no ``.``/``..``
+        segments (they would leave the allowed path)."""
+        if not isinstance(uri, str) or re.search(r"[\x00-\x20\x7f\\]", uri):
+            return False
         try:
             u = urlsplit(uri)
             port = u.port
         except ValueError:
             return False
         if u.username or u.password or u.fragment or not u.hostname:
+            return False
+        if any(seg in (".", "..") or seg.lower() in ("%2e", "%2e%2e", ".%2e", "%2e.")
+               for seg in u.path.split("/")):
             return False
         for a in self.redirects:
             if u.scheme != a.scheme or u.hostname != a.hostname:
@@ -361,7 +370,8 @@ class OAuthServer:
             if form.get("redirect_uri", code["redirect_uri"]) != code["redirect_uri"]:
                 raise OAuthError("invalid_grant", "redirect_uri does not match")
             verifier = form.get("code_verifier", "")
-            if not verifier or not hmac.compare_digest(_s256(verifier), code["code_challenge"]):
+            if not verifier or not hmac.compare_digest(_s256(verifier).encode(),
+                                                       str(code["code_challenge"]).encode()):
                 raise OAuthError("invalid_grant", "PKCE verification failed")
             return self._issue(cid, code.get("user", ""))
         if grant == "refresh_token":
@@ -396,6 +406,12 @@ class OAuthServer:
         if method == "GET" and path.startswith(("/.well-known/oauth-authorization-server",
                                                 "/.well-known/openid-configuration")):
             return self._json(h, 200, self.server_metadata())
+        if method == "POST" and path in ("/register", "/token", "/authorize"):
+            length = content_length(h.headers)
+            if length is None or length > self.MAX_BODY:
+                return self._json(h, 413 if length else 400, {
+                    "error": "invalid_request",
+                    "error_description": "body too large or bad Content-Length"})
         if path == "/register" and method == "POST":
             try:
                 body = json.loads(self._body(h) or b"null")
@@ -445,10 +461,14 @@ class OAuthServer:
             return self._page(h, 401 if req else 400, body)
         return False
 
+    MAX_BODY = 65536
+
     @staticmethod
     def _body(h) -> bytes:
-        length = int(h.headers.get("Content-Length") or 0)
-        return h.rfile.read(min(length, 65536)) if length > 0 else b""
+        """The request body; route() has refused one too large or with a
+        bad Content-Length already, so it is always read in full."""
+        length = content_length(h.headers) or 0
+        return h.rfile.read(length) if length > 0 else b""
 
     def _json(self, h, status: int, obj: dict, extra: dict | None = None) -> bool:
         h._send(status, json.dumps(obj).encode(), "application/json",

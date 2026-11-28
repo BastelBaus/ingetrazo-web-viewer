@@ -38,7 +38,7 @@ from urllib.parse import urlsplit
 from pathlib import Path
 
 from . import folders, shares
-from .common import DATA_DIR, log
+from .common import DATA_DIR, content_length, log, must_close
 from .auth import FULL, Auth, Caller
 from .remote import RemoteApp, mcp_engine_url
 
@@ -74,6 +74,8 @@ LIST_DOCUMENTS = {
 app: RemoteApp
 auth: Auth
 MAX_BUSY = float(os.environ.get("HEALTH_MAX_BUSY_SECONDS") or 900)
+#: The largest MCP request body read (``MCP_MAX_BODY_MB``, default 16).
+MAX_BODY = int(float(os.environ.get("MCP_MAX_BODY_MB") or 16) * 1_000_000)
 
 
 def _text(result: object, is_error: bool = False) -> dict:
@@ -218,6 +220,19 @@ class Handler(BaseHTTPRequestHandler):
             sys.stderr.write("[http] %s %s\n" % (self.address_string(),
                                                  fmt % args))
 
+    def send_response(self, code, message=None):
+        super().send_response(code, message)
+        if must_close(self, code):
+            self.send_header("Connection", "close")
+            self.close_connection = True
+
+    def send_header(self, keyword, value):
+        """A header never carries a line break: input that reaches one (a
+        redirect target) cannot start a header of its own."""
+        if "\r" in str(value) or "\n" in str(value):
+            raise ValueError(f"line break in the {keyword} header")
+        super().send_header(keyword, value)
+
     def _send(self, status: int, body: bytes = b"",
               ctype: str = "application/json", headers: dict | None = None):
         self.send_response(status)
@@ -225,6 +240,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
         for k, v in (headers or {}).items():
             self.send_header(k, v)
         self.end_headers()
@@ -301,7 +317,13 @@ class Handler(BaseHTTPRequestHandler):
         caller = self._authorised()
         if caller is None:
             return None
-        length = int(self.headers.get("Content-Length") or 0)
+        length = content_length(self.headers)
+        if length is None:
+            return self._json(400, {"error": "bad Content-Length"})
+        if length > MAX_BODY:
+            return self._json(413, {"jsonrpc": "2.0", "id": None, "error": {
+                "code": -32600, "message": f"request larger than {MAX_BODY // 1_000_000} MB "
+                                           "(MCP_MAX_BODY_MB)"}})
         try:
             payload = json.loads(self.rfile.read(length) or b"null")
         except ValueError:

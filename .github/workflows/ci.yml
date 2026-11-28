@@ -26,9 +26,9 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Lint shell scripts
-        run: shellcheck entrypoint.sh tests/smoke.sh
+        run: shellcheck entrypoint.sh tests/smoke.sh tests/full.sh
 
-      - name: Unit tests (users, rights, folders, render queue, pages, engine client)
+      - name: Unit tests (users, rights, folders, render queue, pages, engine client, OAuth, logins, security)
         run: python3 -m unittest discover -s tests -p "test_*.py" -v
 
       - uses: docker/setup-buildx-action@v4
