@@ -793,7 +793,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):
         if not self.path.startswith(("/healthz", "/files/", "/static/")):
-            sys.stderr.write("[viewer] %s %s\n" % (self.address_string(), fmt % args))
+            line = fmt % args
+            if "/t/" in line:                    # an access link's token stays out of the log
+                line = re.sub(r"/t/[^\s?\"]+", "/t/…", line)
+            sys.stderr.write("[viewer] %s %s\n" % (self.address_string(), line))
 
     def _send(self, status: int, body: bytes, ctype: str, extra: dict | None = None):
         self.send_response(status)
@@ -829,6 +832,13 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return auth.login(user, pw)
 
+    def _bearer_user(self) -> User | None:
+        """An access link's token as ``Authorization: Bearer itv_…`` (scripts)."""
+        value = self.headers.get("Authorization", "")
+        if not value.startswith("Bearer "):
+            return None
+        return auth.link_login(value[7:])
+
     def _user(self) -> User | None:
         if auth.mode == "none":
             return User("anonymous")
@@ -838,6 +848,9 @@ class Handler(BaseHTTPRequestHandler):
         if user is not None:
             # As the user list has them now (switched off, another role).
             return auth.current(user)
+        bearer = self._bearer_user()
+        if bearer is not None:
+            return bearer
         if auth.mode == "local":
             return self._basic_user()
         return None
@@ -849,6 +862,16 @@ class Handler(BaseHTTPRequestHandler):
         wants_html = "text/html" in self.headers.get("Accept", "")
         page = wants_html and not path.startswith(("/files/", "/events"))
         target = self.path if self.path.startswith("/") else "/"
+        old = self._cookie_user()
+        if old is not None and old.source == "link":
+            clear = {"Set-Cookie": f"{COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"}
+            if page:
+                self._html(403, message_page(
+                    "This access link no longer works: it was switched off, replaced, "
+                    "removed or has expired. Ask whoever gave it to you for a new one."), clear)
+            else:
+                self._send(403, b"access link no longer valid\n", "text/plain", clear)
+            return None
         if self._is_disabled():
             if page:
                 self._html(403, message_page(
@@ -995,7 +1018,15 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._send(303, b"", "text/plain", {"Location": nxt})
             return True
+        if path.startswith("/t/"):
+            return self._link_login(path[3:], nxt)
         if path == "/logout":
+            link = self._cookie_user()
+            if link is not None and link.source == "link":
+                self._html(200, message_page(
+                    "You are logged out. Open your access link again to come back."),
+                    {"Set-Cookie": clear})
+                return True
             if auth.mode == "local":
                 self._send(303, b"", "text/plain",
                            {"Location": "/login", "Set-Cookie": clear})
@@ -1038,6 +1069,24 @@ class Handler(BaseHTTPRequestHandler):
             return True
         self._send(303, b"", "text/plain",
                    {"Location": _safe_next(nxt), "Set-Cookie": self._session_cookie(user)})
+        return True
+
+    def _link_login(self, token: str, nxt: str) -> bool:
+        """``/t/<token>``: an access link logs the browser in, then the
+        address without the token (it stays out of history and referrers)."""
+        if not getattr(auth, "links", False):
+            self._send(404, b"not found\n", "text/plain")
+            return True
+        user = auth.link_login(token)
+        if user is None:
+            time.sleep(0.7)                      # slows down guessing
+            self._html(403, message_page(
+                "This access link does not work (any more). Ask whoever gave it to you "
+                "for a new one."), {"Referrer-Policy": "no-referrer"})
+            return True
+        self._send(303, b"", "text/plain", {
+            "Location": nxt, "Set-Cookie": self._session_cookie(user),
+            "Referrer-Policy": "no-referrer", "Cache-Control": "no-store"})
         return True
 
     def do_GET(self):

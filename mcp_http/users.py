@@ -12,6 +12,12 @@ may use: the web viewer (``web``) and the MCP server (``mcp``, with
 personal access tokens). Admins
 manage the list in the viewer's admin panel (``/admin``).
 
+An *access link* (source ``link``) is a named account without a password:
+whoever opens its link (``/t/<token>``) sees the viewer with that account's
+folders. It may use the web viewer only, never the MCP server, and is
+never an admin; it may expire on a date, and an admin can switch it off,
+replace its link (the old one stops working) or remove it.
+
 Passwords are stored as scrypt hashes. The schema carries its version in
 ``PRAGMA user_version``; newer versions add columns (``MIGRATIONS``).
 """
@@ -31,7 +37,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 ROLES = ("admin", "user")
-SOURCES = ("local", "oidc", "proxy", "guest")
+SOURCES = ("local", "oidc", "proxy", "guest", "link")
+#: Accounts without a login of their own: no password, no MCP, never admin.
+SPECIAL = ("guest", "link")
 #: The guest user: who uses "Log in as guest" (VIEWER_GUEST). One user for
 #: every guest, with settings and rights like any other; never an admin.
 GUEST = "guest"
@@ -70,9 +78,17 @@ MIGRATIONS: list[str | list[str]] = [
        )""",
     # 6: the avatar a user made themself (viewer/avatar.py), as JSON.
     "ALTER TABLE users ADD COLUMN avatar TEXT",
+    # 7: access links: a token's kind (``mcp``: personal MCP token, ``web``:
+    # an access link's secret), and the last day an account may log in.
+    ["ALTER TABLE tokens ADD COLUMN kind TEXT NOT NULL DEFAULT 'mcp'",
+     "ALTER TABLE users ADD COLUMN expires TEXT"],
 ]
 #: A personal MCP token starts with this, so it is recognisable in a config.
 TOKEN_PREFIX = "itz_"
+#: An access link's token starts with this (viewer only, never MCP).
+LINK_PREFIX = "itv_"
+#: The last day of an access link: YYYY-MM-DD (valid through that day, UTC).
+DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 #: The settings a user keeps (the viewer's and later the MCP server's):
 #: name → (allowed values, default). The default ``None`` means "as the
@@ -95,6 +111,26 @@ def _json_dict(text: str | None) -> dict | None:
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _today() -> str:
+    return datetime.now(timezone.utc).date().isoformat()
+
+
+def _check_date(day: str | None) -> str | None:
+    """An expiry date as the form sends it: "" or None is none."""
+    day = (day or "").strip()
+    if not day:
+        return None
+    try:
+        if not DATE.match(day):
+            raise ValueError
+        datetime.strptime(day, "%Y-%m-%d")
+    except ValueError:
+        raise UserError("a date is YYYY-MM-DD") from None
+    if day < _today():
+        raise UserError("that date is in the past")
+    return day
 
 
 def hash_password(password: str) -> str:
@@ -132,10 +168,15 @@ class Account:
     web: bool = True                     # may use the web viewer
     mcp: bool = False                    # may use the MCP server
     avatar: dict | None = None           # None: made from the name
+    expires: str | None = None           # access links: last valid day
 
     @property
     def admin(self) -> bool:
         return self.role == "admin"
+
+    @property
+    def expired(self) -> bool:
+        return bool(self.expires) and self.expires < _today()
 
 
 class UserError(ValueError):
@@ -192,7 +233,8 @@ class Users:
                        bool(row["password"]), groups, row["created"], row["last_login"],
                        config if isinstance(config, dict) else {},
                        shares if isinstance(shares, list) or shares is None else [],
-                       bool(row["web"]), bool(row["mcp"]), _json_dict(row["avatar"]))
+                       bool(row["web"]), bool(row["mcp"]), _json_dict(row["avatar"]),
+                       row["expires"])
 
     def get(self, name: str) -> Account | None:
         with self._lock:
@@ -278,8 +320,9 @@ class Users:
         if role not in ROLES:
             raise UserError(f"the role is one of {', '.join(ROLES)}")
         acc = self._require(name)
-        if role == "admin" and acc.source == "guest":
-            raise UserError("the guest user cannot be an admin")
+        if role == "admin" and acc.source in SPECIAL:
+            raise UserError(f"{'the guest user' if acc.source == 'guest' else 'an access link'} "
+                            "cannot be an admin")
         if role != "admin":
             self._keeps_an_admin(acc)
         with self._lock:
@@ -311,6 +354,8 @@ class Users:
         acc = self.get(name)
         if acc is not None and acc.source == "guest":
             raise UserError(f"the name {GUEST!r} is kept for the guest user")
+        if acc is not None and acc.source == "link":
+            raise UserError(f"the name {acc.name!r} is an access link")
         if acc is None:
             role = "admin" if admin_by_group else "user"
             with self._lock:
@@ -397,6 +442,8 @@ class Users:
             raise UserError("an admin keeps the web viewer; make them a user first")
         if mcp and acc.source == "guest":
             raise UserError("the guest cannot use the MCP server")
+        if mcp and acc.source == "link":
+            raise UserError("an access link is for the web viewer only")
         with self._lock:
             if web is not None:
                 self._db.execute("UPDATE users SET web = ? WHERE name = ?", (int(web), acc.name))
@@ -415,14 +462,16 @@ class Users:
             raise UserError(f"{acc.name} may not use the MCP server")
         token = TOKEN_PREFIX + secrets.token_urlsafe(32)
         with self._lock:
-            self._db.execute("INSERT INTO tokens (hash, user, label, created) VALUES (?, ?, ?, ?)",
+            self._db.execute("INSERT INTO tokens (hash, user, label, created, kind) "
+                             "VALUES (?, ?, ?, ?, 'mcp')",
                              (self._token_hash(token), acc.name, label.strip()[:64], _now()))
         return token
 
     def tokens(self, name: str) -> list[dict]:
         """A user's tokens: id (the start of the hash), label, dates."""
         with self._lock:
-            rows = self._db.execute("SELECT * FROM tokens WHERE user = ? ORDER BY created",
+            rows = self._db.execute("SELECT * FROM tokens WHERE user = ? AND kind = 'mcp' "
+                                    "ORDER BY created",
                                     (name,)).fetchall()
         return [{"id": r["hash"][:12], "label": r["label"], "created": r["created"],
                  "last_used": r["last_used"]} for r in rows]
@@ -431,7 +480,8 @@ class Users:
         if not re.fullmatch(r"[0-9a-f]{12}", token_id or ""):
             return False
         with self._lock:
-            cur = self._db.execute("DELETE FROM tokens WHERE user = ? AND hash LIKE ?",
+            cur = self._db.execute("DELETE FROM tokens WHERE user = ? AND kind = 'mcp' "
+                                   "AND hash LIKE ?",
                                    (name, token_id + "%"))
         return cur.rowcount > 0
 
@@ -441,12 +491,94 @@ class Users:
             return None
         key = self._token_hash(token)
         with self._lock:
-            row = self._db.execute("SELECT user FROM tokens WHERE hash = ?", (key,)).fetchone()
+            row = self._db.execute("SELECT user FROM tokens WHERE hash = ? AND kind = 'mcp'",
+                                   (key,)).fetchone()
             if row is None:
                 return None
             self._db.execute("UPDATE tokens SET last_used = ? WHERE hash = ?", (_now(), key))
         acc = self.get(row["user"])
-        return acc if acc and acc.active and acc.mcp else None
+        return acc if acc and acc.active and acc.mcp and acc.source not in SPECIAL else None
+
+    # ---- access links (viewer only) --------------------------------------------------
+    def create_link(self, name: str, expires: str | None = None) -> tuple[Account, str]:
+        """A new access link: an account ``name`` (web viewer only, no
+        folders yet) and its token, shown once and kept hashed."""
+        name = name.strip()
+        if not NAME.match(name):
+            raise UserError("a name is 1–64 letters, digits or . _ - @ +")
+        if name.lower() == GUEST:
+            raise UserError(f"the name {GUEST!r} is kept for the guest user")
+        day = _check_date(expires)
+        with self._lock:
+            try:
+                self._db.execute(
+                    "INSERT INTO users (name, role, source, created, web, mcp, shares, expires) "
+                    "VALUES (?, 'user', 'link', ?, 1, 0, '[]', ?)", (name, _now(), day))
+            except sqlite3.IntegrityError:
+                raise UserError(f"there is already a user or link {name!r}") from None
+        return self.get(name), self.new_link(name)
+
+    def _link(self, name: str) -> Account:
+        acc = self._require(name)
+        if acc.source != "link":
+            raise UserError(f"{acc.name} is not an access link")
+        return acc
+
+    def new_link(self, name: str) -> str:
+        """A new token for an access link; the old one (and every session
+        opened with it) stops working."""
+        acc = self._link(name)
+        token = LINK_PREFIX + secrets.token_urlsafe(32)
+        with self._lock:
+            self._db.execute("DELETE FROM tokens WHERE user = ? AND kind = 'web'", (acc.name,))
+            self._db.execute("INSERT INTO tokens (hash, user, label, created, kind) "
+                             "VALUES (?, ?, '', ?, 'web')",
+                             (self._token_hash(token), acc.name, _now()))
+        return token
+
+    def set_expires(self, name: str, day: str | None) -> str | None:
+        """The last day an access link works; None: no end."""
+        acc = self._link(name)
+        value = _check_date(day)
+        with self._lock:
+            self._db.execute("UPDATE users SET expires = ? WHERE name = ?", (value, acc.name))
+        return value
+
+    def link_info(self, name: str) -> dict | None:
+        """An access link's token: id (the start of its hash), dates."""
+        with self._lock:
+            row = self._db.execute("SELECT * FROM tokens WHERE user = ? AND kind = 'web'",
+                                   (name,)).fetchone()
+        return None if row is None else {"id": row["hash"][:12], "created": row["created"],
+                                         "last_used": row["last_used"]}
+
+    def by_link(self, token: str) -> tuple[Account, str] | None:
+        """The access link a token opens, and its id, if it may in now
+        (switched on, not expired)."""
+        if not token.startswith(LINK_PREFIX):
+            return None
+        key = self._token_hash(token)
+        with self._lock:
+            row = self._db.execute("SELECT user FROM tokens WHERE hash = ? AND kind = 'web'",
+                                   (key,)).fetchone()
+            if row is None:
+                return None
+            self._db.execute("UPDATE tokens SET last_used = ? WHERE hash = ?", (_now(), key))
+        acc = self.get(row["user"])
+        if not self.link_usable(acc):
+            return None
+        self._touch(acc.name)
+        return acc, key[:12]
+
+    def link_usable(self, acc: Account | None, token_id: str | None = None) -> bool:
+        """Whether an access link may in now; with ``token_id``: and that is
+        still its token (not replaced or removed)."""
+        if acc is None or acc.source != "link" or not acc.active or not acc.web or acc.expired:
+            return False
+        if token_id is None:
+            return True
+        info = self.link_info(acc.name)
+        return info is not None and hmac.compare_digest(info["id"], token_id)
 
     def set_avatar(self, name: str, avatar: dict | None) -> None:
         """The user's avatar (viewer/avatar.py checks it); None: the default."""

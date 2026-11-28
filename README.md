@@ -309,6 +309,13 @@ The users live in one SQLite file, `users.db`, on the volume `users` that both s
   button that lets anyone in without a password, as the one user `guest`. The guest has settings like everyone
   else (shared by all guests), is never an admin, and an admin can switch it off in the panel without restarting.
   `VIEWER_AUTH_MODE=none` stays the viewer without any login.
+- **Access links** (for the `local` and `oidc` logins): at `/admin` → *Access links* an admin names a link (e.g.
+  *Carpenter Meier*), optionally with a last day, and gets its address `https://…/t/itv_…` once. Opening it logs
+  the browser in as that link, without a password; scripts send the token as `Authorization: Bearer itv_…`. A
+  link is an account of its own: it has its own *Folders* (none until the admin chooses some), may use the web
+  viewer only (never MCP, never admin), and everyone with the link shares its settings. *New link* replaces the
+  address (the old one and its sessions stop working at once), *Switch off*, the last day and *Remove* end it
+  too. The token is kept hashed, never written to the log, and dropped from the address after the login.
 - **Settings per user**: what a user switches in the viewer is kept with them, in the user list, and follows them
   to any browser: list or tree in the dropdowns (default `VIEWER_NAV_MODE`), edges in the 3D view. `/account` shows
   them, with *Default* to go back to the container's. Without an account (`VIEWER_AUTH_MODE=none`) the browser
