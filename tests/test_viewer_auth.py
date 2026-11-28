@@ -47,7 +47,8 @@ class SessionsTest(unittest.TestCase):
         payload, _, sig = cookie.partition(".")
         data = json.loads(base64.urlsafe_b64decode(payload + "=="))
         forged = b64(json.dumps({**data, "r": "admin"}).encode())
-        for value in (f"{forged}.{sig}", f"{payload}.{sig[:-1]}0", f"{payload}.", payload,
+        flipped = sig[:-1] + ("1" if sig[-1] == "0" else "0")       # always another one
+        for value in (f"{forged}.{sig}", f"{payload}.{flipped}", f"{payload}.", payload,
                       "", ".", f".{sig}", "x.y", cookie + "x", "é.é"):
             self.assertIsNone(self.s.read(value), value)
 
