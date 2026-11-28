@@ -11,8 +11,9 @@
 #   - a scan of the image for known vulnerabilities (report only)
 #
 # The engine: ENGINE_IMAGE (repo variable) or :dev, as in ci.yml. :dev is
-# built for amd64 only; on arm64 the newest image that has arm64 is used
-# (:dev, else :rc, else :latest) and named in the summary.
+# built for amd64 only; on arm64 the newest image that has arm64 and starts
+# is used (:rc, else :latest), else one built from ingetrazo-docker
+# (ENGINE_REF, default dev). The summary names it.
 #
 # "full test" is the check to require on main: it is green only when both
 # architectures passed.
@@ -73,19 +74,37 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.arch }}
           cache-to: type=gha,scope=${{ matrix.arch }},mode=max
 
+      # An engine image that starts on this architecture: ENGINE_IMAGE, else
+      # :rc, else :latest. Older arm64 images have a PySide6 IngeTrazo cannot
+      # run with (ingelibre/ingetrazo#1728); when none works, the engine is
+      # built from ingetrazo-docker (ENGINE_REF, default dev).
       - name: The engine for ${{ matrix.arch }}
         run: |
           set -euo pipefail
+          works() {
+            docker pull -q --platform "linux/${{ matrix.arch }}" "$1" >/dev/null 2>&1 \
+              && docker run --rm --entrypoint python "$1" -c \
+                   "from PySide6.QtGui import QVector3D; QVector3D(QVector3D(1, 2, 3))" >/dev/null 2>&1
+          }
           base="${ENGINE_IMAGE%:*}"
-          for image in "$ENGINE_IMAGE" "$base:rc" "$base:latest"; do
-            if docker pull -q --platform "linux/${{ matrix.arch }}" "$image" >/dev/null 2>&1; then
-              echo "ENGINE_IMAGE=$image" >> "$GITHUB_ENV"
-              echo "### Engine (${{ matrix.arch }}): \`$image\` ($(docker run --rm --entrypoint cat "$image" /opt/ingetrazo/BUILD_REF))" >> "$GITHUB_STEP_SUMMARY"
-              exit 0
-            fi
-            echo "::notice::$image has no ${{ matrix.arch }} image"
+          image=""
+          for candidate in "$ENGINE_IMAGE" "$base:rc" "$base:latest"; do
+            if works "$candidate"; then image="$candidate"; break; fi
+            echo "::notice::$candidate: no ${{ matrix.arch }} image, or IngeTrazo cannot start in it"
           done
-          echo "::error::no engine image for ${{ matrix.arch }}"; exit 1
+          if [ -z "$image" ]; then
+            ref="${ENGINE_REF:-dev}"
+            echo "::notice::building the engine from BastelBaus/ingetrazo-docker@$ref"
+            git clone -q --depth 1 --branch "$ref" https://github.com/BastelBaus/ingetrazo-docker /tmp/engine
+            docker build -q -t ingetrazo-engine:full /tmp/engine >/dev/null
+            image=ingetrazo-engine:full
+            works "$image" || docker run --rm --entrypoint python "$image" -c \
+              "from PySide6.QtGui import QVector3D; QVector3D(QVector3D(1, 2, 3))"
+          fi
+          echo "ENGINE_IMAGE=$image" >> "$GITHUB_ENV"
+          echo "### Engine (${{ matrix.arch }}): \`$image\` ($(docker run --rm --entrypoint cat "$image" /opt/ingetrazo/BUILD_REF))" >> "$GITHUB_STEP_SUMMARY"
+        env:
+          ENGINE_REF: ${{ vars.ENGINE_REF }}
 
       - name: Smoke test
         env:
