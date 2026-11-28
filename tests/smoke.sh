@@ -145,7 +145,7 @@ echo "  ok"
 "$PY" "$TESTS/smoke_viewer.py" "http://127.0.0.1:$VIEWER_PORT" admin "$PASSWORD"
 
 echo "-- the engine turns away a wrong secret and tools the viewer does not use"
-docker exec -e ETOKEN="$ETOKEN" -e ENGINE="$P-viewer-engine" "$P-viewer" python - <<'PY'
+docker exec -i -e ETOKEN="$ETOKEN" -e ENGINE="$P-viewer-engine" "$P-viewer" python - <<'PY'
 import json, os, urllib.error, urllib.request
 token, engine = os.environ["ETOKEN"], os.environ["ENGINE"]
 def call(tool, args, tok):

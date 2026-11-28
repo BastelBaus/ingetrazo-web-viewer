@@ -59,6 +59,12 @@ def tool(name, **args):
     return reply["result"]
 
 
+def ok(result: dict) -> dict:
+    """A tool result that is no error (else its text in the assertion)."""
+    assert not result.get("isError"), (result.get("content") or [{}])[0].get("text")
+    return result
+
+
 def check(name, fn):
     t0 = time.monotonic()
     fn()
@@ -151,8 +157,8 @@ def main():
         listing = json.loads(tool("list_documents")["content"][0]["text"])
         paths = [d["path"] for f in listing["folders"] for d in f["documents"]]
         assert "arco.igz" in paths, paths
-        assert not tool("open_document", path="arco.igz").get("isError")
-        assert not tool("export_pdf", path="full-out/plan.pdf", format="pdf").get("isError")
+        ok(tool("open_document", path="arco.igz", discard_changes=True))
+        ok(tool("export_pdf", path="full-out/plan.pdf", format="pdf"))
         assert (DATA / "full-out" / "plan.pdf").read_bytes()[:4] == b"%PDF"
         for name, args in (("open_document", {"path": "/etc/passwd"}),
                            ("export_pdf", {"path": "../outside.pdf"}),

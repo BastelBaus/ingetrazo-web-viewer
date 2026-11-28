@@ -98,7 +98,7 @@ echo "-- each engine its own secret; neither takes the other's"
 mt="$(docker exec "$(c mcp-engine)" cat /engine/token)"
 vt="$(docker exec "$(c viewer-engine)" cat /engine/token)"
 [ "${#mt}" -ge 32 ] && [ "${#vt}" -ge 32 ] && [ "$mt" != "$vt" ]
-docker exec -e VT="$vt" "$(c viewer)" python - <<'PY'
+docker exec -i -e VT="$vt" "$(c viewer)" python - <<'PY'
 import json, os, urllib.error, urllib.request
 req = urllib.request.Request("http://mcp-engine:8766/call",
     json.dumps({"tool": "list_documents", "args": {}}).encode(),
